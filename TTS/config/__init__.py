@@ -23,7 +23,7 @@ def read_json_with_comments(json_path):
     return data
 
 
-def register_config(model_name: str) -> Coqpit:
+def register_config(model_name) -> Coqpit:
     """Find the right config for the given model name.
 
     Args:
@@ -56,8 +56,12 @@ def _process_model_name(config_dict: Dict) -> str:
     Returns:
         str: Formatted modelname.
     """
-    model_name = config_dict["model"] if "model" in config_dict else config_dict["generator_model"]
-    model_name = model_name.replace("_generator", "").replace("_discriminator", "")
+    if "model_name" in config_dict:
+        model_name = config_dict["model_name"]
+        return model_name
+    else:
+        model_name = config_dict["model"] if "model" in config_dict else config_dict["generator_model"]
+        model_name = model_name.replace("_generator", "").replace("_discriminator", "")
     return model_name
 
 
