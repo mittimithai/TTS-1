@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from TTS.utils.audio import AudioProcessor
+from TTS.utils.io import load_fsspec
 from TTS.utils.trainer_utils import get_optimizer, get_scheduler
 from TTS.vocoder.datasets.gan_dataset import GANDataset
 from TTS.vocoder.layers.losses import DiscriminatorLoss, GeneratorLoss
@@ -34,7 +35,7 @@ class GAN(BaseVocoder):
             >>> config = HifiganConfig()
             >>> model = GAN(config)
         """
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.model_g = setup_generator(config)
         self.model_d = setup_discriminator(config)
@@ -196,18 +197,24 @@ class GAN(BaseVocoder):
         audios = {f"{name}/audio": sample_voice}
         return figures, audios
 
-    def train_log(self, ap: AudioProcessor, batch: Dict, outputs: Dict) -> Tuple[Dict, np.ndarray]:
+    def train_log(
+        self, batch: Dict, outputs: Dict, logger: "Logger", assets: Dict, steps: int  # pylint: disable=unused-argument
+    ) -> Tuple[Dict, np.ndarray]:
         """Call `_log()` for training."""
-        return self._log("train", ap, batch, outputs)
+        ap = assets["audio_processor"]
+        self._log("train", ap, batch, outputs)
 
     @torch.no_grad()
     def eval_step(self, batch: Dict, criterion: nn.Module, optimizer_idx: int) -> Tuple[Dict, Dict]:
         """Call `train_step()` with `no_grad()`"""
         return self.train_step(batch, criterion, optimizer_idx)
 
-    def eval_log(self, ap: AudioProcessor, batch: Dict, outputs: Dict) -> Tuple[Dict, np.ndarray]:
+    def eval_log(
+        self, batch: Dict, outputs: Dict, logger: "Logger", assets: Dict, steps: int  # pylint: disable=unused-argument
+    ) -> Tuple[Dict, np.ndarray]:
         """Call `_log()` for evaluation."""
-        return self._log("eval", ap, batch, outputs)
+        ap = assets["audio_processor"]
+        self._log("eval", ap, batch, outputs)
 
     def load_checkpoint(
         self,
@@ -222,7 +229,7 @@ class GAN(BaseVocoder):
             checkpoint_path (str): Checkpoint file path.
             eval (bool, optional): If true, load the model for inference. If falseDefaults to False.
         """
-        state = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+        state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"))
         # band-aid for older than v0.0.15 GAN models
         if "model_disc" in state:
             self.model_g.load_checkpoint(config, checkpoint_path, eval)
@@ -298,7 +305,7 @@ class GAN(BaseVocoder):
     def get_data_loader(  # pylint: disable=no-self-use
         self,
         config: Coqpit,
-        ap: AudioProcessor,
+        assets: Dict,
         is_eval: True,
         data_items: List,
         verbose: bool,
@@ -317,6 +324,7 @@ class GAN(BaseVocoder):
         Returns:
             DataLoader: Torch dataloader.
         """
+        ap = assets["audio_processor"]
         dataset = GANDataset(
             ap=ap,
             items=data_items,

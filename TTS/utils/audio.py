@@ -2,19 +2,21 @@ from typing import Dict, Tuple
 
 import librosa
 import numpy as np
+import pyworld as pw
 import scipy.io.wavfile
 import scipy.signal
 import soundfile as sf
 import torch
 from torch import nn
 
-from TTS.tts.utils.data import StandardScaler
-
-# import pyworld as pw
+from TTS.tts.utils.helpers import StandardScaler
 
 
 class TorchSTFT(nn.Module):  # pylint: disable=abstract-method
-    """TODO: Merge this with audio.py"""
+    """Some of the audio processing funtions using Torch for faster batch processing.
+
+    TODO: Merge this with audio.py
+    """
 
     def __init__(
         self,
@@ -28,6 +30,8 @@ class TorchSTFT(nn.Module):  # pylint: disable=abstract-method
         mel_fmax=None,
         n_mels=80,
         use_mel=False,
+        do_amp_to_db=False,
+        spec_gain=1.0,
     ):
         super().__init__()
         self.n_fft = n_fft
@@ -39,6 +43,8 @@ class TorchSTFT(nn.Module):  # pylint: disable=abstract-method
         self.mel_fmax = mel_fmax
         self.n_mels = n_mels
         self.use_mel = use_mel
+        self.do_amp_to_db = do_amp_to_db
+        self.spec_gain = spec_gain
         self.window = nn.Parameter(getattr(torch, window)(win_length), requires_grad=False)
         self.mel_basis = None
         if use_mel:
@@ -79,6 +85,8 @@ class TorchSTFT(nn.Module):  # pylint: disable=abstract-method
         S = torch.sqrt(torch.clamp(M ** 2 + P ** 2, min=1e-8))
         if self.use_mel:
             S = torch.matmul(self.mel_basis.to(x), S)
+        if self.do_amp_to_db:
+            S = self._amp_to_db(S, spec_gain=self.spec_gain)
         return S
 
     def _build_mel_basis(self):
@@ -87,43 +95,113 @@ class TorchSTFT(nn.Module):  # pylint: disable=abstract-method
         )
         self.mel_basis = torch.from_numpy(mel_basis).float()
 
+    @staticmethod
+    def _amp_to_db(x, spec_gain=1.0):
+        return torch.log(torch.clamp(x, min=1e-5) * spec_gain)
+
+    @staticmethod
+    def _db_to_amp(x, spec_gain=1.0):
+        return torch.exp(x) / spec_gain
+
 
 # pylint: disable=too-many-public-methods
 class AudioProcessor(object):
     """Audio Processor for TTS used by all the data pipelines.
+
+    TODO: Make this a dataclass to replace `BaseAudioConfig`.
 
     Note:
         All the class arguments are set to default values to enable a flexible initialization
         of the class with the model config. They are not meaningful for all the arguments.
 
     Args:
-        sample_rate (int, optional): target audio sampling rate. Defaults to None.
-        resample (bool, optional): enable/disable resampling of the audio clips when the target sampling rate does not match the original sampling rate. Defaults to False.
-        num_mels (int, optional): number of melspectrogram dimensions. Defaults to None.
-        log_func (int, optional): log exponent used for converting spectrogram aplitude to DB.
-        min_level_db (int, optional): minimum db threshold for the computed melspectrograms. Defaults to None.
-        frame_shift_ms (int, optional): milliseconds of frames between STFT columns. Defaults to None.
-        frame_length_ms (int, optional): milliseconds of STFT window length. Defaults to None.
-        hop_length (int, optional): number of frames between STFT columns. Used if ```frame_shift_ms``` is None. Defaults to None.
-        win_length (int, optional): STFT window length. Used if ```frame_length_ms``` is None. Defaults to None.
-        ref_level_db (int, optional): reference DB level to avoid background noise. In general <20DB corresponds to the air noise. Defaults to None.
-        fft_size (int, optional): FFT window size for STFT. Defaults to 1024.
-        power (int, optional): Exponent value applied to the spectrogram before GriffinLim. Defaults to None.
-        preemphasis (float, optional): Preemphasis coefficient. Preemphasis is disabled if == 0.0. Defaults to 0.0.
-        signal_norm (bool, optional): enable/disable signal normalization. Defaults to None.
-        symmetric_norm (bool, optional): enable/disable symmetric normalization. If set True normalization is performed in the range [-k, k] else [0, k], Defaults to None.
-        max_norm (float, optional): ```k``` defining the normalization range. Defaults to None.
-        mel_fmin (int, optional): minimum filter frequency for computing melspectrograms. Defaults to None.
-        mel_fmax (int, optional): maximum filter frequency for computing melspectrograms.. Defaults to None.
-        spec_gain (int, optional): gain applied when converting amplitude to DB. Defaults to 20.
-        stft_pad_mode (str, optional): Padding mode for STFT. Defaults to 'reflect'.
-        clip_norm (bool, optional): enable/disable clipping the our of range values in the normalized audio signal. Defaults to True.
-        griffin_lim_iters (int, optional): Number of GriffinLim iterations. Defaults to None.
-        do_trim_silence (bool, optional): enable/disable silence trimming when loading the audio signal. Defaults to False.
-        trim_db (int, optional): DB threshold used for silence trimming. Defaults to 60.
-        do_sound_norm (bool, optional): enable/disable signal normalization. Defaults to False.
-        stats_path (str, optional): Path to the computed stats file. Defaults to None.
-        verbose (bool, optional): enable/disable logging. Defaults to True.
+        sample_rate (int, optional):
+            target audio sampling rate. Defaults to None.
+
+        resample (bool, optional):
+            enable/disable resampling of the audio clips when the target sampling rate does not match the original sampling rate. Defaults to False.
+
+        num_mels (int, optional):
+            number of melspectrogram dimensions. Defaults to None.
+
+        log_func (int, optional):
+            log exponent used for converting spectrogram aplitude to DB.
+
+        min_level_db (int, optional):
+            minimum db threshold for the computed melspectrograms. Defaults to None.
+
+        frame_shift_ms (int, optional):
+            milliseconds of frames between STFT columns. Defaults to None.
+
+        frame_length_ms (int, optional):
+            milliseconds of STFT window length. Defaults to None.
+
+        hop_length (int, optional):
+            number of frames between STFT columns. Used if ```frame_shift_ms``` is None. Defaults to None.
+
+        win_length (int, optional):
+            STFT window length. Used if ```frame_length_ms``` is None. Defaults to None.
+
+        ref_level_db (int, optional):
+            reference DB level to avoid background noise. In general <20DB corresponds to the air noise. Defaults to None.
+
+        fft_size (int, optional):
+            FFT window size for STFT. Defaults to 1024.
+
+        power (int, optional):
+            Exponent value applied to the spectrogram before GriffinLim. Defaults to None.
+
+        preemphasis (float, optional):
+            Preemphasis coefficient. Preemphasis is disabled if == 0.0. Defaults to 0.0.
+
+        signal_norm (bool, optional):
+            enable/disable signal normalization. Defaults to None.
+
+        symmetric_norm (bool, optional):
+            enable/disable symmetric normalization. If set True normalization is performed in the range [-k, k] else [0, k], Defaults to None.
+
+        max_norm (float, optional):
+            ```k``` defining the normalization range. Defaults to None.
+
+        mel_fmin (int, optional):
+            minimum filter frequency for computing melspectrograms. Defaults to None.
+
+        mel_fmax (int, optional):
+            maximum filter frequency for computing melspectrograms.. Defaults to None.
+
+        spec_gain (int, optional):
+            gain applied when converting amplitude to DB. Defaults to 20.
+
+        stft_pad_mode (str, optional):
+            Padding mode for STFT. Defaults to 'reflect'.
+
+        clip_norm (bool, optional):
+            enable/disable clipping the our of range values in the normalized audio signal. Defaults to True.
+
+        griffin_lim_iters (int, optional):
+            Number of GriffinLim iterations. Defaults to None.
+
+        do_trim_silence (bool, optional):
+            enable/disable silence trimming when loading the audio signal. Defaults to False.
+
+        trim_db (int, optional):
+            DB threshold used for silence trimming. Defaults to 60.
+
+        do_sound_norm (bool, optional):
+            enable/disable signal normalization. Defaults to False.
+
+        do_amp_to_db_linear (bool, optional):
+            enable/disable amplitude to dB conversion of linear spectrograms. Defaults to True.
+
+        do_amp_to_db_mel (bool, optional):
+            enable/disable amplitude to dB conversion of mel spectrograms. Defaults to True.
+
+        stats_path (str, optional):
+            Path to the computed stats file. Defaults to None.
+
+        verbose (bool, optional):
+            enable/disable logging. Defaults to True.
+
     """
 
     def __init__(
@@ -153,6 +231,8 @@ class AudioProcessor(object):
         do_trim_silence=False,
         trim_db=60,
         do_sound_norm=False,
+        do_amp_to_db_linear=True,
+        do_amp_to_db_mel=True,
         stats_path=None,
         verbose=True,
         **_,
@@ -162,6 +242,7 @@ class AudioProcessor(object):
         self.sample_rate = sample_rate
         self.resample = resample
         self.num_mels = num_mels
+        self.log_func = log_func
         self.min_level_db = min_level_db or 0
         self.frame_shift_ms = frame_shift_ms
         self.frame_length_ms = frame_length_ms
@@ -181,6 +262,8 @@ class AudioProcessor(object):
         self.do_trim_silence = do_trim_silence
         self.trim_db = trim_db
         self.do_sound_norm = do_sound_norm
+        self.do_amp_to_db_linear = do_amp_to_db_linear
+        self.do_amp_to_db_mel = do_amp_to_db_mel
         self.stats_path = stats_path
         # setup exp_func for db to amp conversion
         if log_func == "np.log":
@@ -381,7 +464,6 @@ class AudioProcessor(object):
         Returns:
             np.ndarray: Decibels spectrogram.
         """
-
         return self.spec_gain * _log(np.maximum(1e-5, x), self.base)
 
     # pylint: disable=no-self-use
@@ -448,7 +530,10 @@ class AudioProcessor(object):
             D = self._stft(self.apply_preemphasis(y))
         else:
             D = self._stft(y)
-        S = self._amp_to_db(np.abs(D))
+        if self.do_amp_to_db_linear:
+            S = self._amp_to_db(np.abs(D))
+        else:
+            S = np.abs(D)
         return self.normalize(S).astype(np.float32)
 
     def melspectrogram(self, y: np.ndarray) -> np.ndarray:
@@ -457,7 +542,10 @@ class AudioProcessor(object):
             D = self._stft(self.apply_preemphasis(y))
         else:
             D = self._stft(y)
-        S = self._amp_to_db(self._linear_to_mel(np.abs(D)))
+        if self.do_amp_to_db_mel:
+            S = self._amp_to_db(self._linear_to_mel(np.abs(D)))
+        else:
+            S = self._linear_to_mel(np.abs(D))
         return self.normalize(S).astype(np.float32)
 
     def inv_spectrogram(self, spectrogram: np.ndarray) -> np.ndarray:
@@ -522,6 +610,9 @@ class AudioProcessor(object):
         angles = np.exp(2j * np.pi * np.random.rand(*S.shape))
         S_complex = np.abs(S).astype(np.complex)
         y = self._istft(S_complex * angles)
+        if not np.isfinite(y).all():
+            print(" [!] Waveform is not finite everywhere. Skipping the GL.")
+            return np.array([0.0])
         for _ in range(self.griffin_lim_iters):
             angles = np.exp(1j * np.angle(self._stft(y)))
             y = self._istft(S_complex * angles)
@@ -536,20 +627,54 @@ class AudioProcessor(object):
             return 0, pad
         return pad // 2, pad // 2 + pad % 2
 
-    ### Compute F0 ###
-    # TODO: pw causes some dep issues
-    # def compute_f0(self, x):
-    #     f0, t = pw.dio(
-    #         x.astype(np.double),
-    #         fs=self.sample_rate,
-    #         f0_ceil=self.mel_fmax,
-    #         frame_period=1000 * self.hop_length / self.sample_rate,
-    #     )
-    #     f0 = pw.stonemask(x.astype(np.double), f0, t, self.sample_rate)
-    #     return f0
+    def compute_f0(self, x: np.ndarray) -> np.ndarray:
+        """Compute pitch (f0) of a waveform using the same parameters used for computing melspectrogram.
+
+        Args:
+            x (np.ndarray): Waveform.
+
+        Returns:
+            np.ndarray: Pitch.
+
+        Examples:
+            >>> WAV_FILE = filename = librosa.util.example_audio_file()
+            >>> from TTS.config import BaseAudioConfig
+            >>> from TTS.utils.audio import AudioProcessor
+            >>> conf = BaseAudioConfig(mel_fmax=8000)
+            >>> ap = AudioProcessor(**conf)
+            >>> wav = ap.load_wav(WAV_FILE, sr=22050)[:5 * 22050]
+            >>> pitch = ap.compute_f0(wav)
+        """
+        # align F0 length to the spectrogram length
+        if len(x) % self.hop_length == 0:
+            x = np.pad(x, (0, self.hop_length // 2), mode="reflect")
+
+        f0, t = pw.dio(
+            x.astype(np.double),
+            fs=self.sample_rate,
+            f0_ceil=self.mel_fmax,
+            frame_period=1000 * self.hop_length / self.sample_rate,
+        )
+        f0 = pw.stonemask(x.astype(np.double), f0, t, self.sample_rate)
+        # pad = int((self.win_length / self.hop_length) / 2)
+        # f0 = [0.0] * pad + f0 + [0.0] * pad
+        # f0 = np.pad(f0, (pad, pad), mode="constant", constant_values=0)
+        # f0 = np.array(f0, dtype=np.float32)
+
+        # f01, _, _ = librosa.pyin(
+        #     x,
+        #     fmin=65 if self.mel_fmin == 0 else self.mel_fmin,
+        #     fmax=self.mel_fmax,
+        #     frame_length=self.win_length,
+        #     sr=self.sample_rate,
+        #     fill_na=0.0,
+        # )
+
+        # spec = self.melspectrogram(x)
+        return f0
 
     ### Audio Processing ###
-    def find_endpoint(self, wav: np.ndarray, threshold_db=-40, min_silence_sec=0.8) -> int:
+    def find_endpoint(self, wav: np.ndarray, min_silence_sec=0.8) -> int:
         """Find the last point without silence at the end of a audio signal.
 
         Args:
@@ -562,7 +687,7 @@ class AudioProcessor(object):
         """
         window_length = int(self.sample_rate * min_silence_sec)
         hop_length = int(window_length / 4)
-        threshold = self._db_to_amp(threshold_db)
+        threshold = self._db_to_amp(-self.trim_db)
         for x in range(hop_length, len(wav) - window_length, hop_length):
             if np.max(wav[x : x + window_length]) < threshold:
                 return x + hop_length
@@ -625,6 +750,14 @@ class AudioProcessor(object):
         """
         wav_norm = wav * (32767 / max(0.01, np.max(np.abs(wav))))
         scipy.io.wavfile.write(path, sr if sr else self.sample_rate, wav_norm.astype(np.int16))
+
+    def get_duration(self, filename: str) -> float:
+        """Get the duration of a wav file using Librosa.
+
+        Args:
+            filename (str): Path to the wav file.
+        """
+        return librosa.get_duration(filename)
 
     @staticmethod
     def mulaw_encode(wav: np.ndarray, qc: int) -> np.ndarray:

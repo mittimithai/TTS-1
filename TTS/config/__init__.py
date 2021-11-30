@@ -3,6 +3,7 @@ import os
 import re
 from typing import Dict
 
+import fsspec
 import yaml
 from coqpit import Coqpit
 
@@ -13,7 +14,7 @@ from TTS.utils.generic_utils import find_module
 def read_json_with_comments(json_path):
     """for backward compat."""
     # fallback to json
-    with open(json_path, "r", encoding="utf-8") as f:
+    with fsspec.open(json_path, "r", encoding="utf-8") as f:
         input_str = f.read()
     # handle comments
     input_str = re.sub(r"\\\n", "", input_str)
@@ -35,10 +36,11 @@ def register_config(model_name: str) -> Coqpit:
         Coqpit: config class.
     """
     config_class = None
+    config_name = model_name + "_config"
     paths = ["TTS.tts.configs", "TTS.vocoder.configs", "TTS.speaker_encoder"]
     for path in paths:
         try:
-            config_class = find_module(path, model_name + "_config")
+            config_class = find_module(path, config_name)
         except ModuleNotFoundError:
             pass
     if config_class is None:
@@ -76,13 +78,12 @@ def load_config(config_path: str) -> None:
     config_dict = {}
     ext = os.path.splitext(config_path)[1]
     if ext in (".yml", ".yaml"):
-        with open(config_path, "r", encoding="utf-8") as f:
+        with fsspec.open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
     elif ext == ".json":
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                input_str = f.read()
-                data = json.loads(input_str)
+            with fsspec.open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
         except json.decoder.JSONDecodeError:
             # backwards compat.
             data = read_json_with_comments(config_path)

@@ -1,45 +1,46 @@
 # -*- coding: utf-8 -*-
 
-import glob
 import importlib
-import logging
+import multiprocessing
 import os
 import platform
-import re
 import sys
 import time
 import traceback
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Union
+from inspect import signature
+from typing import Callable, Dict, List, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from coqpit import Coqpit
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP_th
 from torch.utils.data import DataLoader
 
-from TTS.config import load_config, register_config
-from TTS.tts.datasets import load_meta_data
-from TTS.tts.models import setup_model as setup_tts_model
-from TTS.tts.utils.text.symbols import parse_symbols
-from TTS.utils.audio import AudioProcessor
 from TTS.utils.callbacks import TrainerCallback
 from TTS.utils.distribute import init_distributed
 from TTS.utils.generic_utils import (
     KeepAverage,
     count_parameters,
-    create_experiment_folder,
+    get_experiment_folder_path,
     get_git_branch,
     remove_experiment_folder,
     set_init_dict,
     to_cuda,
 )
-from TTS.utils.io import copy_model_files, save_best_model, save_checkpoint
-from TTS.utils.logging import ConsoleLogger, TensorboardLogger
-from TTS.utils.trainer_utils import get_optimizer, get_scheduler, is_apex_available, setup_torch_training_env
-from TTS.vocoder.datasets.preprocess import load_wav_data, load_wav_feat_data
-from TTS.vocoder.models import setup_model as setup_vocoder_model
+from TTS.utils.io import copy_model_files, load_fsspec, save_best_model, save_checkpoint
+from TTS.utils.logging import ConsoleLogger, TensorboardLogger, WandbLogger, init_dashboard_logger
+from TTS.utils.trainer_utils import (
+    get_last_checkpoint,
+    get_optimizer,
+    get_scheduler,
+    is_apex_available,
+    setup_torch_training_env,
+)
+
+multiprocessing.set_start_method("fork")
 
 if platform.system() != "Windows":
     # https://github.com/pytorch/pytorch/issues/973
@@ -47,6 +48,7 @@ if platform.system() != "Windows":
 
     rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (4096, rlimit[1]))
+
 
 if is_apex_available():
     from apex import amp
@@ -72,24 +74,37 @@ class TrainingArgs(Coqpit):
     best_path: str = field(
         default="",
         metadata={
-            "help": "Best model file to be used for extracting best loss. If not specified, the latest best model in continue path is used"
+            "help": "Best model file to be used for extracting the best loss. If not specified, the latest best model in continue path is used"
         },
+    )
+    skip_train_epoch: bool = field(
+        default=False, metadata={"help": "Run only evaluation iteration. Useful for debugging."}
     )
     config_path: str = field(default="", metadata={"help": "Path to the configuration file."})
     rank: int = field(default=0, metadata={"help": "Process rank in distributed training."})
     group_id: str = field(default="", metadata={"help": "Process group id in distributed training."})
+    use_ddp: bool = field(
+        default=False,
+        metadata={"help": "Use DDP in distributed training. It is to set in `distribute.py`. Do not set manually."},
+    )
 
 
 class Trainer:
-    def __init__(
+    def __init__(  # pylint: disable=dangerous-default-value
         self,
         args: Union[Coqpit, Namespace],
         config: Coqpit,
         output_path: str,
         c_logger: ConsoleLogger = None,
-        tb_logger: TensorboardLogger = None,
+        dashboard_logger: Union[TensorboardLogger, WandbLogger] = None,
         model: nn.Module = None,
+        get_model: Callable = None,
+        get_data_samples: Callable = None,
+        train_samples: List = None,
+        eval_samples: List = None,
         cudnn_benchmark: bool = False,
+        training_assets: Dict = {},
+        parse_command_line_args: bool = True,
     ) -> None:
         """Simple yet powerful 🐸💬 TTS trainer for PyTorch. It can train all the available `tts` and `vocoder` models
         or easily be customized.
@@ -112,60 +127,108 @@ class Trainer:
             c_logger (ConsoleLogger, optional): Console logger for printing training status. If not provided, the default
                 console logger is used. Defaults to None.
 
-            tb_logger (TensorboardLogger, optional): Tensorboard logger. If not provided, the default logger is used.
+            dashboard_logger Union[TensorboardLogger, WandbLogger]: Dashboard logger. If not provided, the tensorboard logger is used.
                 Defaults to None.
 
             model (nn.Module, optional): Initialized and ready-to-train model. If it is not defined, `Trainer`
                 initializes a model from the provided config. Defaults to None.
 
+            get_model (Callable):
+                A function that returns a model. It is used to initialize the model when `model` is not provided.
+                It either takes the config as the only argument or does not take any argument.
+                Defaults to None
+
+            get_data_samples (Callable):
+                A function that returns a list of training and evaluation samples. Used if `train_samples` and
+                `eval_samples` are None. Defaults to None.
+
+            train_samples (List):
+                A list of training samples used by the model's `get_data_loader` to init the `dataset` and the
+                `data_loader`. Defaults to None.
+
+            eval_samples (List):
+                A list of evaluation samples used by the model's `get_data_loader` to init the `dataset` and the
+                `data_loader`. Defaults to None.
+
             cudnn_benchmark (bool): enable/disable PyTorch cudnn benchmarking. It is better to disable if the model input
                 length is changing batch to batch along the training.
 
+            training_assets (Dict):
+                A dictionary of assets to be used at training and passed to the model's ```train_log(), eval_log(), get_data_loader()```
+                during training. It can include  `AudioProcessor` or/and `Tokenizer`. Defaults to {}.
+
+            parse_command_line_args (bool):
+                If true, parse command-line arguments and update `TrainingArgs` and model `config` values. Set it
+                to false if you parse the arguments yourself. Defaults to True.
+
         Examples:
 
-            Running trainer on a model.
+            Running trainer with HifiGAN model.
 
             >>> args = TrainingArgs(...)
             >>> config = HifiganConfig(...)
             >>> model = GANModel(config)
-            >>> trainer = Trainer(args, config, output_path, model=model)
-            >>> trainer.fit()
-
-            Running trainer on a config.
-
-            >>> config = WavegradConfig(data_path="/home/erogol/nvme/gdrive/Datasets/LJSpeech-1.1/wavs/", output_path=output_path,)
-            >>> args, config, output_path, _, c_logger, tb_logger = init_training(TrainingArgs(), config)
-            >>> trainer = Trainer(args, config, output_path, c_logger, tb_logger)
+            >>> ap = AudioProcessor(**config.audio)
+            >>> assets = {"audio_processor": ap}
+            >>> trainer = Trainer(args, config, output_path, model=model, training_assets=assets)
             >>> trainer.fit()
 
         TODO:
+            - Wrap model for not calling .module in DDP.
             - Accumulate gradients b/w batches.
             - Deepspeed integration
             - Profiler integration.
             - Overfitting to a batch.
             - TPU training
+            - NOTE: Consider moving `training_assets` to the model implementation.
         """
 
-        # set and initialize Pytorch runtime
-        self.use_cuda, self.num_gpus = setup_torch_training_env(True, cudnn_benchmark)
+        if parse_command_line_args:
+            # parse command-line arguments for TrainerArgs()
+            args, coqpit_overrides = self.parse_argv(args)
 
-        if config is None:
-            # parse config from console arguments
-            config, output_path, _, c_logger, tb_logger = process_args(args)
+            # get ready for training and parse command-line arguments for the model config
+            config = self.init_training(args, coqpit_overrides, config)
 
-        self.output_path = output_path
+        # set the output path
+        if args.continue_path:
+            # use the same path as the continuing run
+            output_path = args.continue_path
+        else:
+            # override the output path if it is provided
+            output_path = config.output_path if output_path is None else output_path
+            # create a new output folder name
+            output_path = get_experiment_folder_path(config.output_path, config.run_name)
+            os.makedirs(output_path, exist_ok=True)
+
+        # copy training assets to the output folder
+        copy_model_files(config, output_path, new_fields=None)
+
+        # init class members
         self.args = args
         self.config = config
+        self.output_path = output_path
+        self.config.output_log_path = output_path
+        self.training_assets = training_assets
+
+        # setup logging
+        log_file = os.path.join(self.output_path, f"trainer_{args.rank}_log.txt")
+        self._setup_logger_config(log_file)
+        time.sleep(1.0)  # wait for the logger to be ready
+
+        # set and initialize Pytorch runtime
+        self.use_cuda, self.num_gpus = setup_torch_training_env(True, cudnn_benchmark, args.use_ddp)
 
         # init loggers
         self.c_logger = ConsoleLogger() if c_logger is None else c_logger
-        if tb_logger is None:
-            self.tb_logger = TensorboardLogger(output_path, model_name=config.model)
-            self.tb_logger.tb_add_text("model-config", f"<pre>{config.to_json()}</pre>", 0)
-        else:
-            self.tb_logger = tb_logger
-        log_file = os.path.join(self.output_path, f"trainer_{args.rank}_log.txt")
-        self._setup_logger_config(log_file)
+        self.dashboard_logger = dashboard_logger
+
+        # only allow dashboard logging for the main process in DDP mode
+        if self.dashboard_logger is None and args.rank == 0:
+            self.dashboard_logger = init_dashboard_logger(config)
+
+        if not self.config.log_model_step:
+            self.config.log_model_step = self.config.save_step
 
         self.total_steps_done = 0
         self.epochs_done = 0
@@ -173,7 +236,6 @@ class Trainer:
         self.best_loss = float("inf")
         self.train_loader = None
         self.eval_loader = None
-        self.output_audio_path = os.path.join(output_path, "test_audios")
 
         self.keep_avg_train = None
         self.keep_avg_eval = None
@@ -181,29 +243,22 @@ class Trainer:
         self.use_apex = self._is_apex_available()
         self.use_amp_scaler = self.config.mixed_precision and self.use_cuda
 
-        # init audio processor
-        self.ap = AudioProcessor(**self.config.audio.to_dict())
-
-        # load dataset samples
-        # TODO: refactor this
-        if "datasets" in self.config:
-            # load data for `tts` models
-            self.data_train, self.data_eval = load_meta_data(self.config.datasets)
-        elif self.config.feature_path is not None:
-            # load data for `vocoder`models
-            print(f" > Loading features from: {self.config.feature_path}")
-            self.data_eval, self.data_train = load_wav_feat_data(
-                self.config.data_path, self.config.feature_path, self.config.eval_split_size
-            )
+        # load data samples
+        if train_samples is None and get_data_samples is None:
+            raise ValueError("[!] `train_samples` and `get_data_samples` cannot both be None.")
+        if train_samples is not None:
+            self.train_samples = train_samples
+            self.eval_samples = eval_samples
         else:
-            # load data for `vocoder`models
-            self.data_eval, self.data_train = load_wav_data(self.config.data_path, self.config.eval_split_size)
+            self.train_samples, self.eval_samples = self.run_get_data_samples(config, get_data_samples)
 
         # init TTS model
+        if model is None and get_model is None:
+            raise ValueError("[!] `model` and `get_model` cannot both be None.")
         if model is not None:
             self.model = model
         else:
-            self.model = self.get_model(self.config)
+            self.run_get_model(self.config, get_model)
 
         # setup criterion
         self.criterion = self.get_criterion(self.model)
@@ -228,7 +283,7 @@ class Trainer:
         # setup optimizer
         self.optimizer = self.get_optimizer(self.model, self.config)
 
-        # callback
+        # CALLBACK
         self.callbacks = TrainerCallback(self)
         self.callbacks.on_init_start()
 
@@ -237,10 +292,10 @@ class Trainer:
             if self.use_apex:
                 self.scaler = None
                 self.model, self.optimizer = amp.initialize(self.model, self.optimizer, opt_level="O1")
-            if isinstance(self.optimizer, list):
-                self.scaler = [torch.cuda.amp.GradScaler()] * len(self.optimizer)
-            else:
-                self.scaler = torch.cuda.amp.GradScaler()
+            # if isinstance(self.optimizer, list):
+            #     self.scaler = [torch.cuda.amp.GradScaler()] * len(self.optimizer)
+            # else:
+            self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
 
@@ -252,7 +307,16 @@ class Trainer:
         # setup scheduler
         self.scheduler = self.get_scheduler(self.model, self.config, self.optimizer)
 
-        # DISTRUBUTED
+        if self.scheduler is not None:
+            if self.args.continue_path:
+                if isinstance(self.scheduler, list):
+                    for scheduler in self.scheduler:
+                        if scheduler is not None:
+                            scheduler.last_epoch = self.restore_step
+                else:
+                    self.scheduler.last_epoch = self.restore_step
+
+        # DISTRIBUTED
         if self.num_gpus > 1:
             self.model = DDP_th(self.model, device_ids=[args.rank], output_device=args.rank)
 
@@ -263,8 +327,56 @@ class Trainer:
         self.callbacks.on_init_end()
 
     @staticmethod
-    def get_model(config: Coqpit) -> nn.Module:
-        """Initialize model from config.
+    def parse_argv(args: Union[Coqpit, List]):
+        """Parse command line arguments to init or override `TrainingArgs()`."""
+        if isinstance(args, Coqpit):
+            parser = args.init_argparse(arg_prefix="")
+        else:
+            train_config = TrainingArgs()
+            parser = train_config.init_argparse(arg_prefix="")
+        training_args, coqpit_overrides = parser.parse_known_args()
+        args.parse_args(training_args)
+        return args, coqpit_overrides
+
+    def init_training(
+        self, args: TrainingArgs, coqpit_overrides: Dict, config: Coqpit = None
+    ):  # pylint: disable=no-self-use
+        """Initialize training and update model configs from command line arguments.
+
+        Args:
+            args (argparse.Namespace or dict like): Parsed input arguments.
+            config_overrides (argparse.Namespace or dict like): Parsed config overriding arguments.
+            config (Coqpit): Model config. If none, it is generated from `args`. Defaults to None.
+
+        Returns:
+            c (TTS.utils.io.AttrDict): Config paramaters.
+        """
+        # set arguments for continuing training
+        if args.continue_path:
+            experiment_path = args.continue_path
+            args.config_path = os.path.join(args.continue_path, "config.json")
+            args.restore_path, best_model = get_last_checkpoint(args.continue_path)
+            if not args.best_path:
+                args.best_path = best_model
+
+        # override config values from command-line args
+        # TODO: Maybe it is better to do it outside
+        if len(coqpit_overrides) > 0:
+            config.parse_known_args(coqpit_overrides, arg_prefix="coqpit", relaxed_parser=True)
+        experiment_path = args.continue_path
+
+        # update the config.json fields and copy it to the output folder
+        if args.rank == 0:
+            new_fields = {}
+            if args.restore_path:
+                new_fields["restore_path"] = args.restore_path
+            new_fields["github_branch"] = get_git_branch()
+            copy_model_files(config, experiment_path, new_fields)
+        return config
+
+    @staticmethod
+    def run_get_model(config: Coqpit, get_model: Callable) -> nn.Module:
+        """Run the `get_model` function and return the model.
 
         Args:
             config (Coqpit): Model config.
@@ -272,12 +384,21 @@ class Trainer:
         Returns:
             nn.Module: initialized model.
         """
-        # TODO: better model setup
-        try:
-            model = setup_tts_model(config)
-        except ModuleNotFoundError:
-            model = setup_vocoder_model(config)
+        if len(signature(get_model).sig.parameters) == 1:
+            model = get_model(config)
+        else:
+            model = get_model()
         return model
+
+    @staticmethod
+    def run_get_data_samples(config: Coqpit, get_data_samples: Callable) -> nn.Module:
+        if callable(get_data_samples):
+            if len(signature(get_data_samples).sig.parameters) == 1:
+                train_samples, eval_samples = get_data_samples(config)
+            else:
+                train_samples, eval_samples = get_data_samples()
+            return train_samples, eval_samples
+        return None, None
 
     def restore_model(
         self,
@@ -309,14 +430,14 @@ class Trainer:
             return obj
 
         print(" > Restoring from %s ..." % os.path.basename(restore_path))
-        checkpoint = torch.load(restore_path)
+        checkpoint = load_fsspec(restore_path, map_location="cpu")
         try:
             print(" > Restoring Model...")
             model.load_state_dict(checkpoint["model"])
             print(" > Restoring Optimizer...")
             optimizer = _restore_list_objs(checkpoint["optimizer"], optimizer)
             if "scaler" in checkpoint and self.use_amp_scaler and checkpoint["scaler"]:
-                print(" > Restoring AMP Scaler...")
+                print(" > Restoring Scaler...")
                 scaler = _restore_list_objs(checkpoint["scaler"], scaler)
         except (KeyError, RuntimeError):
             print(" > Partial model initialization...")
@@ -336,23 +457,34 @@ class Trainer:
             " > Model restored from step %d" % checkpoint["step"],
         )
         restore_step = checkpoint["step"]
+        torch.cuda.empty_cache()
         return model, optimizer, scaler, restore_step
 
-    @staticmethod
+    #########################
+    # DATA LOADING FUNCTIONS
+    #########################
+
     def _get_loader(
+        self,
         model: nn.Module,
         config: Coqpit,
-        ap: AudioProcessor,
+        assets: Dict,
         is_eval: bool,
         data_items: List,
         verbose: bool,
         num_gpus: int,
     ) -> DataLoader:
-        if hasattr(model, "get_data_loader"):
-            loader = model.get_data_loader(config, ap, is_eval, data_items, verbose, num_gpus)
+        if num_gpus > 1:
+            if hasattr(model.module, "get_data_loader"):
+                loader = model.module.get_data_loader(
+                    config, assets, is_eval, data_items, verbose, num_gpus, self.args.rank
+                )
+        else:
+            if hasattr(model, "get_data_loader"):
+                loader = model.get_data_loader(config, assets, is_eval, data_items, verbose, num_gpus)
         return loader
 
-    def get_train_dataloader(self, ap: AudioProcessor, data_items: List, verbose: bool) -> DataLoader:
+    def get_train_dataloader(self, training_assets: Dict, data_items: List, verbose: bool) -> DataLoader:
         """Initialize and return a training data loader.
 
         Args:
@@ -363,10 +495,10 @@ class Trainer:
         Returns:
             DataLoader: Initialized training data loader.
         """
-        return self._get_loader(self.model, self.config, ap, False, data_items, verbose, self.num_gpus)
+        return self._get_loader(self.model, self.config, training_assets, False, data_items, verbose, self.num_gpus)
 
-    def get_eval_dataloader(self, ap: AudioProcessor, data_items: List, verbose: bool) -> DataLoader:
-        return self._get_loader(self.model, self.config, ap, True, data_items, verbose, self.num_gpus)
+    def get_eval_dataloader(self, training_assets: Dict, data_items: List, verbose: bool) -> DataLoader:
+        return self._get_loader(self.model, self.config, training_assets, True, data_items, verbose, self.num_gpus)
 
     def format_batch(self, batch: List) -> Dict:
         """Format the dataloader output and return a batch.
@@ -377,11 +509,31 @@ class Trainer:
         Returns:
             Dict: Formatted batch.
         """
-        batch = self.model.format_batch(batch)
+        if self.num_gpus > 1:
+            batch = self.model.module.format_batch(batch)
+        else:
+            batch = self.model.format_batch(batch)
         if self.use_cuda:
             for k, v in batch.items():
                 batch[k] = to_cuda(v)
         return batch
+
+    ######################
+    # TRAIN FUNCTIONS
+    ######################
+
+    @staticmethod
+    def master_params(optimizer: torch.optim.Optimizer):
+        """Generator over parameters owned by the optimizer.
+
+        Used to select parameters used by the optimizer for gradient clipping.
+
+        Args:
+            optimizer: Target optimizer.
+        """
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                yield p
 
     @staticmethod
     def _model_train_step(
@@ -417,7 +569,7 @@ class Trainer:
         scheduler: Union[torch.optim.lr_scheduler._LRScheduler, List],  # pylint: disable=protected-access
         config: Coqpit,
         optimizer_idx: int = None,
-    ) -> Tuple[Dict, Dict, int, torch.Tensor]:
+    ) -> Tuple[Dict, Dict, int]:
         """Perform a forward - backward pass and run the optimizer.
 
         Args:
@@ -426,7 +578,7 @@ class Trainer:
             optimizer (Union[nn.optim.Optimizer, List]): Model's optimizer. If it is a list then, `optimizer_idx` must be defined to indicate the optimizer in use.
             scaler (AMPScaler): AMP scaler.
             criterion (nn.Module): Model's criterion.
-            scheduler (Union[torch.optim.lr_scheduler._LRScheduler, List]): LR scheduler used by the optimizer.
+            scheduler (torch.optim.lr_scheduler._LRScheduler): LR scheduler used by the optimizer.
             config (Coqpit): Model config.
             optimizer_idx (int, optional): Target optimizer being used. Defaults to None.
 
@@ -436,9 +588,12 @@ class Trainer:
         Returns:
             Tuple[Dict, Dict, int, torch.Tensor]: model outputs, losses, step time and gradient norm.
         """
+
         step_start_time = time.time()
         # zero-out optimizer
         optimizer.zero_grad()
+
+        # forward pass and loss computation
         with torch.cuda.amp.autocast(enabled=config.mixed_precision):
             if optimizer_idx is not None:
                 outputs, loss_dict = self._model_train_step(batch, model, criterion, optimizer_idx=optimizer_idx)
@@ -448,11 +603,11 @@ class Trainer:
         # skip the rest
         if outputs is None:
             step_time = time.time() - step_start_time
-            return None, {}, step_time, 0
+            return None, {}, step_time
 
-        # check nan loss
-        if torch.isnan(loss_dict["loss"]).any():
-            raise RuntimeError(f"Detected NaN loss at step {self.total_steps_done}.")
+        # # check nan loss
+        # if torch.isnan(loss_dict["loss"]).any():
+        #     raise RuntimeError(f" > NaN loss detected  - {loss_dict}")
 
         # set gradient clipping threshold
         if "grad_clip" in config and config.grad_clip is not None:
@@ -463,30 +618,27 @@ class Trainer:
         else:
             grad_clip = 0.0  # meaning no gradient clipping
 
-        # TODO: compute grad norm
-        if grad_clip <= 0:
-            grad_norm = 0
-
         # optimizer step
+        grad_norm = 0
         update_lr_scheduler = True
         if self.use_amp_scaler:
             if self.use_apex:
+                # TODO: verify AMP use for GAN training in TTS
+                # https://nvidia.github.io/apex/advanced.html?highlight=accumulate#backward-passes-with-multiple-optimizers
                 with amp.scale_loss(loss_dict["loss"], optimizer) as scaled_loss:
                     scaled_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    amp.master_params(optimizer),
-                    grad_clip,
-                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), grad_clip)
             else:
                 # model optimizer step in mixed precision mode
                 scaler.scale(loss_dict["loss"]).backward()
-                scaler.unscale_(optimizer)
                 if grad_clip > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.master_params(optimizer), grad_clip)
                 scale_prev = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
                 update_lr_scheduler = scale_prev <= scaler.get_scale()
+                loss_dict["amp_scaler"] = scaler.get_scale()  # for logging
         else:
             # main model optimizer step
             loss_dict["loss"].backward()
@@ -494,10 +646,14 @@ class Trainer:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
+        # pytorch skips the step when the norm is 0. So ignore the norm value when it is NaN
+        if isinstance(grad_norm, torch.Tensor) and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+            grad_norm = 0
+
         step_time = time.time() - step_start_time
 
         # setup lr
-        if scheduler is not None and update_lr_scheduler:
+        if scheduler is not None and update_lr_scheduler and not self.config.scheduler_after_epoch:
             scheduler.step()
 
         # detach losses
@@ -505,25 +661,9 @@ class Trainer:
         if optimizer_idx is not None:
             loss_dict[f"loss_{optimizer_idx}"] = loss_dict.pop("loss")
             loss_dict[f"grad_norm_{optimizer_idx}"] = grad_norm
-        return outputs, loss_dict, step_time, grad_norm
-
-    @staticmethod
-    def _detach_loss_dict(loss_dict: Dict) -> Dict:
-        """Detach loss values from autograp.
-
-        Args:
-            loss_dict (Dict): losses.
-
-        Returns:
-            Dict: losses detached from autograph.
-        """
-        loss_dict_detached = {}
-        for key, value in loss_dict.items():
-            if isinstance(value, (int, float)):
-                loss_dict_detached[key] = value
-            else:
-                loss_dict_detached[key] = value.item()
-        return loss_dict_detached
+        else:
+            loss_dict["grad_norm"] = grad_norm
+        return outputs, loss_dict, step_time
 
     def train_step(self, batch: Dict, batch_n_steps: int, step: int, loader_start_time: float) -> Tuple[Dict, Dict]:
         """Perform a training step on a batch of inputs and log the process.
@@ -544,11 +684,10 @@ class Trainer:
 
         # conteainers to hold model outputs and losses for each optimizer.
         outputs_per_optimizer = None
-        log_dict = {}
         loss_dict = {}
         if not isinstance(self.optimizer, list):
             # training with a single optimizer
-            outputs, loss_dict_new, step_time, grad_norm = self._optimize(
+            outputs, loss_dict_new, step_time = self._optimize(
                 batch, self.model, self.optimizer, self.scaler, self.criterion, self.scheduler, self.config
             )
             loss_dict.update(loss_dict_new)
@@ -558,26 +697,38 @@ class Trainer:
             total_step_time = 0
             for idx, optimizer in enumerate(self.optimizer):
                 criterion = self.criterion
-                scaler = self.scaler[idx] if self.use_amp_scaler else None
+                # scaler = self.scaler[idx] if self.use_amp_scaler else None
+                scaler = self.scaler
                 scheduler = self.scheduler[idx]
-                outputs, loss_dict_new, step_time, grad_norm = self._optimize(
+                outputs, loss_dict_new, step_time = self._optimize(
                     batch, self.model, optimizer, scaler, criterion, scheduler, self.config, idx
                 )
                 # skip the rest if the model returns None
                 total_step_time += step_time
                 outputs_per_optimizer[idx] = outputs
+                # merge loss_dicts from each optimizer
+                # rename duplicates with the optimizer idx
                 # if None, model skipped this optimizer
                 if loss_dict_new is not None:
-                    loss_dict.update(loss_dict_new)
+                    for k, v in loss_dict_new.items():
+                        if k in loss_dict:
+                            loss_dict[f"{k}-{idx}"] = v
+                        else:
+                            loss_dict[k] = v
+                step_time = total_step_time
             outputs = outputs_per_optimizer
 
-        # update avg stats
-        keep_avg_update = dict()
-        for key, value in log_dict.items():
-            keep_avg_update["avg_" + key] = value
+        # update avg runtime stats
+        keep_avg_update = {}
         keep_avg_update["avg_loader_time"] = loader_time
         keep_avg_update["avg_step_time"] = step_time
         self.keep_avg_train.update_values(keep_avg_update)
+
+        # update avg loss stats
+        update_eval_values = {}
+        for key, value in loss_dict.items():
+            update_eval_values["avg_" + key] = value
+        self.keep_avg_train.update_values(update_eval_values)
 
         # print training progress
         if self.total_steps_done % self.config.print_step == 0:
@@ -590,33 +741,28 @@ class Trainer:
             else:
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 lrs = {"current_lr": current_lr}
-            log_dict.update(lrs)
-            if grad_norm > 0:
-                log_dict.update({"grad_norm": grad_norm})
+
             # log run-time stats
-            log_dict.update(
+            loss_dict.update(lrs)
+            loss_dict.update(
                 {
                     "step_time": round(step_time, 4),
                     "loader_time": round(loader_time, 4),
                 }
             )
             self.c_logger.print_train_step(
-                batch_n_steps, step, self.total_steps_done, log_dict, loss_dict, self.keep_avg_train.avg_values
+                batch_n_steps, step, self.total_steps_done, loss_dict, self.keep_avg_train.avg_values
             )
 
         if self.args.rank == 0:
             # Plot Training Iter Stats
             # reduce TB load and don't log every step
-            if self.total_steps_done % self.config.tb_plot_step == 0:
-                iter_stats = log_dict
-                iter_stats.update(loss_dict)
-                self.tb_logger.tb_train_step_stats(self.total_steps_done, iter_stats)
+            if self.total_steps_done % self.config.plot_step == 0:
+                self.dashboard_logger.train_step_stats(self.total_steps_done, loss_dict)
             if self.total_steps_done % self.config.save_step == 0 and self.total_steps_done != 0:
                 if self.config.checkpoint:
                     # checkpoint the model
-                    model_loss = (
-                        loss_dict[self.config.target_loss] if "target_loss" in self.config else loss_dict["loss"]
-                    )
+                    target_avg_loss = self._pick_target_avg_loss(self.keep_avg_train)
                     save_checkpoint(
                         self.config,
                         self.model,
@@ -625,47 +771,74 @@ class Trainer:
                         self.total_steps_done,
                         self.epochs_done,
                         self.output_path,
-                        model_loss=model_loss,
+                        model_loss=target_avg_loss,
                     )
+
+                    if self.total_steps_done % self.config.log_model_step == 0:
+                        # log checkpoint as artifact
+                        aliases = [f"epoch-{self.epochs_done}", f"step-{self.total_steps_done}"]
+                        self.dashboard_logger.log_artifact(self.output_path, "checkpoint", "model", aliases)
+
                 # training visualizations
-                figures, audios = None, None
                 if hasattr(self.model, "module") and hasattr(self.model.module, "train_log"):
-                    figures, audios = self.model.module.train_log(self.ap, batch, outputs)
+                    self.model.module.train_log(
+                        batch, outputs, self.dashboard_logger, self.training_assets, self.total_steps_done
+                    )
                 elif hasattr(self.model, "train_log"):
-                    figures, audios = self.model.train_log(self.ap, batch, outputs)
-                if figures is not None:
-                    self.tb_logger.tb_train_figures(self.total_steps_done, figures)
-                if audios is not None:
-                    self.tb_logger.tb_train_audios(self.total_steps_done, audios, self.ap.sample_rate)
+                    self.model.train_log(
+                        batch, outputs, self.dashboard_logger, self.training_assets, self.total_steps_done
+                    )
+
+            self.dashboard_logger.flush()
+
         self.total_steps_done += 1
         self.callbacks.on_train_step_end()
         return outputs, loss_dict
 
     def train_epoch(self) -> None:
         """Main entry point for the training loop. Run training on the all training samples."""
+        # initialize the data loader
         self.train_loader = self.get_train_dataloader(
-            self.ap,
-            self.data_train,
+            self.training_assets,
+            self.train_samples,
             verbose=True,
         )
-        self.model.train()
+        # set model to training mode
+        if self.num_gpus > 1:
+            self.model.module.train()
+        else:
+            self.model.train()
         epoch_start_time = time.time()
         if self.use_cuda:
             batch_num_steps = int(len(self.train_loader.dataset) / (self.config.batch_size * self.num_gpus))
         else:
             batch_num_steps = int(len(self.train_loader.dataset) / self.config.batch_size)
         self.c_logger.print_train_start()
+        loader_start_time = time.time()
+        # iterate over the training samples
         for cur_step, batch in enumerate(self.train_loader):
-            loader_start_time = time.time()
             _, _ = self.train_step(batch, batch_num_steps, cur_step, loader_start_time)
+            loader_start_time = time.time()
         epoch_time = time.time() - epoch_start_time
-        # Plot self.epochs_done Stats
+        # plot self.epochs_done Stats
         if self.args.rank == 0:
             epoch_stats = {"epoch_time": epoch_time}
             epoch_stats.update(self.keep_avg_train.avg_values)
-            self.tb_logger.tb_train_epoch_stats(self.total_steps_done, epoch_stats)
-            if self.config.tb_model_param_stats:
-                self.tb_logger.tb_model_weights(self.model, self.total_steps_done)
+            self.dashboard_logger.train_epoch_stats(self.total_steps_done, epoch_stats)
+            if self.config.model_param_stats:
+                self.logger.model_weights(self.model, self.total_steps_done)
+        # scheduler step after the epoch
+        if self.scheduler is not None and self.config.scheduler_after_epoch:
+            if isinstance(self.scheduler, list):
+                for scheduler in self.scheduler:
+                    if scheduler is not None:
+                        scheduler.step()
+            else:
+                self.scheduler.step()
+
+    #######################
+    # EVAL FUNCTIONS
+    #######################
 
     @staticmethod
     def _model_eval_step(
@@ -701,22 +874,25 @@ class Trainer:
             Tuple[Dict, Dict]: Model outputs and losses.
         """
         with torch.no_grad():
-            outputs_per_optimizer = None
+            outputs = []
             loss_dict = {}
             if not isinstance(self.optimizer, list):
                 outputs, loss_dict = self._model_eval_step(batch, self.model, self.criterion)
             else:
-                outputs_per_optimizer = [None] * len(self.optimizer)
+                outputs = [None] * len(self.optimizer)
                 for idx, _ in enumerate(self.optimizer):
                     criterion = self.criterion
-                    outputs, loss_dict_new = self._model_eval_step(batch, self.model, criterion, idx)
-                    outputs_per_optimizer[idx] = outputs
+                    outputs_, loss_dict_new = self._model_eval_step(batch, self.model, criterion, idx)
+                    outputs[idx] = outputs_
+
                     if loss_dict_new is not None:
+                        loss_dict_new[f"loss_{idx}"] = loss_dict_new.pop("loss")
                         loss_dict.update(loss_dict_new)
-                outputs = outputs_per_optimizer
+
+            loss_dict = self._detach_loss_dict(loss_dict)
 
             # update avg stats
-            update_eval_values = dict()
+            update_eval_values = {}
             for key, value in loss_dict.items():
                 update_eval_values["avg_" + key] = value
             self.keep_avg_eval.update_values(update_eval_values)
@@ -729,8 +905,8 @@ class Trainer:
         """Main entry point for the evaluation loop. Run evaluation on the all validation samples."""
         self.eval_loader = (
             self.get_eval_dataloader(
-                self.ap,
-                self.data_eval,
+                self.training_assets,
+                self.eval_samples,
                 verbose=True,
             )
             if self.config.run_eval
@@ -747,47 +923,73 @@ class Trainer:
             loader_time = time.time() - loader_start_time
             self.keep_avg_eval.update_values({"avg_loader_time": loader_time})
             outputs, _ = self.eval_step(batch, cur_step)
+            loader_start_time = time.time()
         # plot epoch stats, artifacts and figures
         if self.args.rank == 0:
-            figures, audios = None, None
             if hasattr(self.model, "module") and hasattr(self.model.module, "eval_log"):
-                figures, audios = self.model.module.eval_log(self.ap, batch, outputs)
+                self.model.module.eval_log(
+                    batch, outputs, self.dashboard_logger, self.training_assets, self.total_steps_done
+                )
             elif hasattr(self.model, "eval_log"):
-                figures, audios = self.model.eval_log(self.ap, batch, outputs)
-            if figures is not None:
-                self.tb_logger.tb_eval_figures(self.total_steps_done, figures)
-            if audios is not None:
-                self.tb_logger.tb_eval_audios(self.total_steps_done, audios, self.ap.sample_rate)
-            self.tb_logger.tb_eval_stats(self.total_steps_done, self.keep_avg_eval.avg_values)
+                self.model.eval_log(batch, outputs, self.dashboard_logger, self.training_assets, self.total_steps_done)
+            self.dashboard_logger.eval_stats(self.total_steps_done, self.keep_avg_eval.avg_values)
 
     def test_run(self) -> None:
         """Run test and log the results. Test run must be defined by the model.
         Model must return figures and audios to be logged by the Tensorboard."""
-        if hasattr(self.model, "test_run"):
+        if hasattr(self.model, "test_run") or (self.num_gpus > 1 and hasattr(self.model.module, "test_run")):
+            if self.eval_loader is None:
+                self.eval_loader = self.get_eval_dataloader(
+                    self.training_assets,
+                    self.eval_samples,
+                    verbose=True,
+                )
+
             if hasattr(self.eval_loader.dataset, "load_test_samples"):
                 samples = self.eval_loader.dataset.load_test_samples(1)
-                figures, audios = self.model.test_run(self.ap, samples, None)
+                if self.num_gpus > 1:
+                    figures, audios = self.model.module.test_run(self.training_assets, samples, None)
+                else:
+                    figures, audios = self.model.test_run(self.training_assets, samples, None)
             else:
-                figures, audios = self.model.test_run(self.ap)
-            self.tb_logger.tb_test_audios(self.total_steps_done, audios, self.config.audio["sample_rate"])
-            self.tb_logger.tb_test_figures(self.total_steps_done, figures)
+                if self.num_gpus > 1:
+                    figures, audios = self.model.module.test_run(self.training_assets)
+                else:
+                    figures, audios = self.model.test_run(self.training_assets)
+            self.dashboard_logger.test_audios(self.total_steps_done, audios, self.config.audio["sample_rate"])
+            self.dashboard_logger.test_figures(self.total_steps_done, figures)
+
+    def _restore_best_loss(self):
+        """Restore the best loss from the args.best_path if provided else
+        from the model (`args.restore_path` or `args.continue_path`) used for resuming the training"""
+        if self.restore_step != 0 or self.args.best_path:
+            print(f" > Restoring best loss from {os.path.basename(self.args.best_path)} ...")
+            ch = load_fsspec(self.args.restore_path, map_location="cpu")
+            if "model_loss" in ch:
+                self.best_loss = ch["model_loss"]
+            print(f" > Starting with loaded last best loss {self.best_loss}.")
+
+    ###################################
+    # FIT FUNCTIONS
+    ###################################
 
     def _fit(self) -> None:
         """🏃 train -> evaluate -> test for the number of epochs."""
-        if self.restore_step != 0 or self.args.best_path:
-            print(" > Restoring best loss from " f"{os.path.basename(self.args.best_path)} ...")
-            self.best_loss = torch.load(self.args.best_path, map_location="cpu")["model_loss"]
-            print(f" > Starting with loaded last best loss {self.best_loss}.")
+        self._restore_best_loss()
 
         self.total_steps_done = self.restore_step
 
         for epoch in range(0, self.config.epochs):
+            if self.num_gpus > 1:
+                # let all processes sync up before starting with a new epoch of training
+                dist.barrier()
             self.callbacks.on_epoch_start()
             self.keep_avg_train = KeepAverage()
             self.keep_avg_eval = KeepAverage() if self.config.run_eval else None
             self.epochs_done = epoch
-            self.c_logger.print_epoch_start(epoch, self.config.epochs)
-            self.train_epoch()
+            self.c_logger.print_epoch_start(epoch, self.config.epochs, self.output_path)
+            if not self.args.skip_train_epoch:
+                self.train_epoch()
             if self.config.run_eval:
                 self.eval_epoch()
             if epoch >= self.config.test_delay_epochs and self.args.rank <= 0:
@@ -795,17 +997,26 @@ class Trainer:
             self.c_logger.print_epoch_end(
                 epoch, self.keep_avg_eval.avg_values if self.config.run_eval else self.keep_avg_train.avg_values
             )
-            self.save_best_model()
+            if self.args.rank in [None, 0]:
+                self.save_best_model()
             self.callbacks.on_epoch_end()
 
     def fit(self) -> None:
         """Where the ✨️magic✨️ happens..."""
         try:
             self._fit()
+            if self.args.rank == 0:
+                self.dashboard_logger.finish()
         except KeyboardInterrupt:
             self.callbacks.on_keyboard_interrupt()
             # if the output folder is empty remove the run.
             remove_experiment_folder(self.output_path)
+            # clear the DDP processes
+            if self.num_gpus > 1:
+                dist.destroy_process_group()
+            # finish the wandb run and sync data
+            if self.args.rank == 0:
+                self.dashboard_logger.finish()
             # stop without error signal
             try:
                 sys.exit(0)
@@ -818,8 +1029,13 @@ class Trainer:
 
     def save_best_model(self) -> None:
         """Save the best model. It only saves if the current target loss is smaller then the previous."""
+
+        # set the target loss to choose the best model
+        target_loss_dict = self._pick_target_avg_loss(self.keep_avg_eval if self.keep_avg_eval else self.keep_avg_train)
+
+        # save the model and update the best_loss
         self.best_loss = save_best_model(
-            self.keep_avg_eval["avg_loss"] if self.keep_avg_eval else self.keep_avg_train["avg_loss"],
+            target_loss_dict,
             self.best_loss,
             self.config,
             self.model,
@@ -832,16 +1048,9 @@ class Trainer:
             keep_after=self.config.keep_after,
         )
 
-    @staticmethod
-    def _setup_logger_config(log_file: str) -> None:
-        logging.basicConfig(
-            level=logging.INFO, format="", handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
-        )
-
-    @staticmethod
-    def _is_apex_available() -> bool:
-        """Check if Nvidia's APEX is available."""
-        return importlib.util.find_spec("apex") is not None
+    #####################
+    # GET FUNCTIONS
+    #####################
 
     @staticmethod
     def get_optimizer(model: nn.Module, config: Coqpit) -> Union[torch.optim.Optimizer, List]:
@@ -919,149 +1128,72 @@ class Trainer:
         criterion = model.get_criterion()
         return criterion
 
+    ####################
+    # HELPER FUNCTIONS
+    ####################
 
-def init_arguments():
-    train_config = TrainingArgs()
-    parser = train_config.init_argparse(arg_prefix="")
-    return parser
+    @staticmethod
+    def _detach_loss_dict(loss_dict: Dict) -> Dict:
+        """Detach loss values from autograp.
 
+        Args:
+            loss_dict (Dict): losses.
 
-def get_last_checkpoint(path):
-    """Get latest checkpoint or/and best model in path.
+        Returns:
+            Dict: losses detached from autograph.
+        """
+        loss_dict_detached = {}
+        for key, value in loss_dict.items():
+            if isinstance(value, (int, float)):
+                loss_dict_detached[key] = value
+            else:
+                loss_dict_detached[key] = value.detach().item()
+        return loss_dict_detached
 
-    It is based on globbing for `*.pth.tar` and the RegEx
-    `(checkpoint|best_model)_([0-9]+)`.
+    def _pick_target_avg_loss(self, keep_avg_target: KeepAverage) -> Dict:
+        """Pick the target loss to compare models"""
+        target_avg_loss = None
 
-    Args:
-        path (list): Path to files to be compared.
+        # return if target loss defined in the model config
+        if "target_loss" in self.config and self.config.target_loss:
+            return keep_avg_target[f"avg_{self.config.target_loss}"]
 
-    Raises:
-        ValueError: If no checkpoint or best_model files are found.
-
-    Returns:
-        last_checkpoint (str): Last checkpoint filename.
-    """
-    file_names = glob.glob(os.path.join(path, "*.pth.tar"))
-    last_models = {}
-    last_model_nums = {}
-    for key in ["checkpoint", "best_model"]:
-        last_model_num = None
-        last_model = None
-        # pass all the checkpoint files and find
-        # the one with the largest model number suffix.
-        for file_name in file_names:
-            match = re.search(f"{key}_([0-9]+)", file_name)
-            if match is not None:
-                model_num = int(match.groups()[0])
-                if last_model_num is None or model_num > last_model_num:
-                    last_model_num = model_num
-                    last_model = file_name
-
-        # if there is not checkpoint found above
-        # find the checkpoint with the latest
-        # modification date.
-        key_file_names = [fn for fn in file_names if key in fn]
-        if last_model is None and len(key_file_names) > 0:
-            last_model = max(key_file_names, key=os.path.getctime)
-            last_model_num = torch.load(last_model)["step"]
-
-        if last_model is not None:
-            last_models[key] = last_model
-            last_model_nums[key] = last_model_num
-
-    # check what models were found
-    if not last_models:
-        raise ValueError(f"No models found in continue path {path}!")
-    if "checkpoint" not in last_models:  # no checkpoint just best model
-        last_models["checkpoint"] = last_models["best_model"]
-    elif "best_model" not in last_models:  # no best model
-        # this shouldn't happen, but let's handle it just in case
-        last_models["best_model"] = None
-    # finally check if last best model is more recent than checkpoint
-    elif last_model_nums["best_model"] > last_model_nums["checkpoint"]:
-        last_models["checkpoint"] = last_models["best_model"]
-
-    return last_models["checkpoint"], last_models["best_model"]
-
-
-def process_args(args, config=None):
-    """Process parsed comand line arguments and initialize the config if not provided.
-
-    Args:
-        args (argparse.Namespace or dict like): Parsed input arguments.
-        config (Coqpit): Model config. If none, it is generated from `args`. Defaults to None.
-
-    Returns:
-        c (TTS.utils.io.AttrDict): Config paramaters.
-        out_path (str): Path to save models and logging.
-        audio_path (str): Path to save generated test audios.
-        c_logger (TTS.utils.console_logger.ConsoleLogger): Class that does
-            logging to the console.
-        tb_logger (TTS.utils.tensorboard.TensorboardLogger): Class that does
-            the TensorBoard logging.
-
-    TODO:
-        - Interactive config definition.
-    """
-    if isinstance(args, tuple):
-        args, coqpit_overrides = args
-    if args.continue_path:
-        # continue a previous training from its output folder
-        experiment_path = args.continue_path
-        args.config_path = os.path.join(args.continue_path, "config.json")
-        args.restore_path, best_model = get_last_checkpoint(args.continue_path)
-        if not args.best_path:
-            args.best_path = best_model
-    # init config if not already defined
-    if config is None:
-        if args.config_path:
-            # init from a file
-            config = load_config(args.config_path)
+        # take the average of loss_{optimizer_idx} as the target loss when there are multiple optimizers
+        if isinstance(self.optimizer, list):
+            target_avg_loss = 0
+            for idx in range(len(self.optimizer)):
+                target_avg_loss += keep_avg_target[f"avg_loss_{idx}"]
+            target_avg_loss /= len(self.optimizer)
         else:
-            # init from console args
-            from TTS.config.shared_configs import BaseTrainingConfig  # pylint: disable=import-outside-toplevel
+            target_avg_loss = keep_avg_target["avg_loss"]
+        return target_avg_loss
 
-            config_base = BaseTrainingConfig()
-            config_base.parse_known_args(coqpit_overrides)
-            config = register_config(config_base.model)()
-    # override values from command-line args
-    config.parse_known_args(coqpit_overrides, relaxed_parser=True)
-    if config.mixed_precision:
-        print("   >  Mixed precision mode is ON")
-    experiment_path = args.continue_path
-    if not experiment_path:
-        experiment_path = create_experiment_folder(config.output_path, config.run_name)
-    audio_path = os.path.join(experiment_path, "test_audios")
-    # setup rank 0 process in distributed training
-    tb_logger = None
-    if args.rank == 0:
-        os.makedirs(audio_path, exist_ok=True)
-        new_fields = {}
-        if args.restore_path:
-            new_fields["restore_path"] = args.restore_path
-        new_fields["github_branch"] = get_git_branch()
-        # if model characters are not set in the config file
-        # save the default set to the config file for future
-        # compatibility.
-        if config.has("characters_config"):
-            used_characters = parse_symbols()
-            new_fields["characters"] = used_characters
-        copy_model_files(config, experiment_path, new_fields)
-        os.chmod(audio_path, 0o775)
-        os.chmod(experiment_path, 0o775)
-        tb_logger = TensorboardLogger(experiment_path, model_name=config.model)
-        # write model desc to tensorboard
-        tb_logger.tb_add_text("model-config", f"<pre>{config.to_json()}</pre>", 0)
-    c_logger = ConsoleLogger()
-    return config, experiment_path, audio_path, c_logger, tb_logger
+    def _setup_logger_config(self, log_file: str) -> None:
+        """Write log strings to a file and print logs to the terminal.
+        TODO: Causes formatting issues in pdb debugging."""
 
+        class Logger(object):
+            def __init__(self, print_to_terminal=True):
+                self.print_to_terminal = print_to_terminal
+                self.terminal = sys.stdout
+                self.log_file = log_file
 
-def init_training(argv: Union[List, Coqpit], config: Coqpit = None):
-    """Initialization of a training run."""
-    if isinstance(argv, Coqpit):
-        parser = argv.init_argparse(arg_prefix="")
-    else:
-        parser = init_arguments()
-    args = parser.parse_known_args()
-    config, OUT_PATH, AUDIO_PATH, c_logger, tb_logger = process_args(args, config)
-    return args[0], config, OUT_PATH, AUDIO_PATH, c_logger, tb_logger
+            def write(self, message):
+                if self.print_to_terminal:
+                    self.terminal.write(message)
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(message)
+
+            def flush(self):
+                # this flush method is needed for python 3 compatibility.
+                # this handles the flush command by doing nothing.
+                # you might want to specify some extra behavior here.
+                pass
+
+        # don't let processes rank > 0 write to the terminal
+        sys.stdout = Logger(self.args.rank == 0)
+
+    @staticmethod
+    def _is_apex_available() -> bool:
+        """Check if Nvidia's APEX is available."""
+        return importlib.util.find_spec("apex") is not None

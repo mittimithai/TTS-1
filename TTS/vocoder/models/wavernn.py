@@ -5,14 +5,15 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from coqpit import Coqpit
+from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from TTS.tts.utils.visual import plot_spectrogram
 from TTS.utils.audio import AudioProcessor
+from TTS.utils.io import load_fsspec
 from TTS.vocoder.datasets.wavernn_dataset import WaveRNNDataset
 from TTS.vocoder.layers.losses import WaveRNNLoss
 from TTS.vocoder.models.base_vocoder import BaseVocoder
@@ -221,10 +222,7 @@ class Wavernn(BaseVocoder):
             samples at once. The Subscale WaveRNN produces 16 samples per step without loss of quality and offers an
             orthogonal method for increasing sampling efficiency.
         """
-        super().__init__()
-
-        self.args = config.model_params
-        self.config = config
+        super().__init__(config)
 
         if isinstance(self.args.mode, int):
             self.n_classes = 2 ** self.args.mode
@@ -545,7 +543,7 @@ class Wavernn(BaseVocoder):
     def load_checkpoint(
         self, config, checkpoint_path, eval=False
     ):  # pylint: disable=unused-argument, redefined-builtin
-        state = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+        state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"))
         self.load_state_dict(state["model"])
         if eval:
             self.eval()
@@ -571,8 +569,9 @@ class Wavernn(BaseVocoder):
 
     @torch.no_grad()
     def test_run(
-        self, ap: AudioProcessor, samples: List[Dict], output: Dict  # pylint: disable=unused-argument
+        self, assets: Dict, samples: List[Dict], output: Dict  # pylint: disable=unused-argument
     ) -> Tuple[Dict, Dict]:
+        ap = assets["audio_processor"]
         figures = {}
         audios = {}
         for idx, sample in enumerate(samples):
@@ -599,20 +598,21 @@ class Wavernn(BaseVocoder):
     def get_data_loader(  # pylint: disable=no-self-use
         self,
         config: Coqpit,
-        ap: AudioProcessor,
+        assets: Dict,
         is_eval: True,
         data_items: List,
         verbose: bool,
         num_gpus: int,
     ):
+        ap = assets["audio_processor"]
         dataset = WaveRNNDataset(
             ap=ap,
             items=data_items,
             seq_len=config.seq_len,
             hop_len=ap.hop_length,
-            pad=config.model_params.pad,
-            mode=config.model_params.mode,
-            mulaw=config.model_params.mulaw,
+            pad=config.model_args.pad,
+            mode=config.model_args.mode,
+            mulaw=config.model_args.mulaw,
             is_training=not is_eval,
             verbose=verbose,
         )

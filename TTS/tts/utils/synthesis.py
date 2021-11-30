@@ -15,7 +15,7 @@ if "tensorflow" in installed or "tensorflow-gpu" in installed:
     import tensorflow as tf
 
 
-def text_to_seq(text, CONFIG):
+def text_to_seq(text, CONFIG, custom_symbols=None):
     text_cleaner = [CONFIG.text_cleaner]
     # text ot phonemes to sequence vector
     if CONFIG.use_phonemes:
@@ -28,16 +28,14 @@ def text_to_seq(text, CONFIG):
                 tp=CONFIG.characters,
                 add_blank=CONFIG.add_blank,
                 use_espeak_phonemes=CONFIG.use_espeak_phonemes,
+                custom_symbols=custom_symbols,
             ),
             dtype=np.int32,
         )
     else:
         seq = np.asarray(
             text_to_sequence(
-                text,
-                text_cleaner,
-                tp=CONFIG.characters,
-                add_blank=CONFIG.add_blank,
+                text, text_cleaner, tp=CONFIG.characters, add_blank=CONFIG.add_blank, custom_symbols=custom_symbols
             ),
             dtype=np.int32,
         )
@@ -174,7 +172,7 @@ def speaker_id_to_torch(speaker_id, cuda=False):
 def embedding_to_torch(d_vector, cuda=False):
     if d_vector is not None:
         d_vector = np.asarray(d_vector)
-        d_vector = torch.from_numpy(d_vector).unsqueeze(0).type(torch.FloatTensor)
+        d_vector = torch.from_numpy(d_vector).type(torch.FloatTensor)
     if cuda:
         return d_vector.cuda()
     return d_vector
@@ -212,30 +210,55 @@ def synthesis(
     d_vector=None,
     backend="torch",
 ):
-    """Synthesize voice for the given text.
+    """Synthesize voice for the given text using Griffin-Lim vocoder or just compute output features to be passed to
+    the vocoder model.
 
     Args:
-        model (TTS.tts.models): model to synthesize.
-        text (str): target text
-        CONFIG (dict): config dictionary to be loaded from config.json.
-        use_cuda (bool): enable cuda.
-        ap (TTS.tts.utils.audio.AudioProcessor): audio processor to process
-            model outputs.
-        speaker_id (int): id of speaker
-        style_wav (str | Dict[str, float]): Uses for style embedding of GST.
-        enable_eos_bos_chars (bool): enable special chars for end of sentence and start of sentence.
-        do_trim_silence (bool): trim silence after synthesis.
-        backend (str): tf or torch
+        model (TTS.tts.models):
+            The TTS model to synthesize audio with.
+
+        text (str):
+            The input text to convert to speech.
+
+        CONFIG (Coqpit):
+            Model configuration.
+
+        use_cuda (bool):
+            Enable/disable CUDA.
+
+        ap (TTS.tts.utils.audio.AudioProcessor):
+            The audio processor for extracting features and pre/post-processing audio.
+
+        speaker_id (int):
+            Speaker ID passed to the speaker embedding layer in multi-speaker model. Defaults to None.
+
+        style_wav (str | Dict[str, float]):
+            Path or tensor to/of a waveform used for computing the style embedding. Defaults to None.
+
+        enable_eos_bos_chars (bool):
+            enable special chars for end of sentence and start of sentence. Defaults to False.
+
+        do_trim_silence (bool):
+            trim silence after synthesis. Defaults to False.
+
+        d_vector (torch.Tensor):
+            d-vector for multi-speaker models in share :math:`[1, D]`. Defaults to None.
+
+        backend (str):
+            tf or torch. Defaults to "torch".
     """
     # GST processing
     style_mel = None
+    custom_symbols = None
     if CONFIG.has("gst") and CONFIG.gst and style_wav is not None:
         if isinstance(style_wav, dict):
             style_mel = style_wav
         else:
             style_mel = compute_style_mel(style_wav, ap, cuda=use_cuda)
+    if hasattr(model, "make_symbols"):
+        custom_symbols = model.make_symbols(CONFIG)
     # preprocess the given text
-    text_inputs = text_to_seq(text, CONFIG)
+    text_inputs = text_to_seq(text, CONFIG, custom_symbols=custom_symbols)
     # pass tensors to backend
     if backend == "torch":
         if speaker_id is not None:
@@ -274,15 +297,18 @@ def synthesis(
     # convert outputs to numpy
     # plot results
     wav = None
-    if use_griffin_lim:
-        wav = inv_spectrogram(model_outputs, ap, CONFIG)
-        # trim silence
-        if do_trim_silence:
-            wav = trim_silence(wav, ap)
+    if hasattr(model, "END2END") and model.END2END:
+        wav = model_outputs.squeeze(0)
+    else:
+        if use_griffin_lim:
+            wav = inv_spectrogram(model_outputs, ap, CONFIG)
+            # trim silence
+            if do_trim_silence:
+                wav = trim_silence(wav, ap)
     return_dict = {
         "wav": wav,
         "alignments": alignments,
-        "model_outputs": model_outputs,
         "text_inputs": text_inputs,
+        "outputs": outputs,
     }
     return return_dict
