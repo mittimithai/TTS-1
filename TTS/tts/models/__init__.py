@@ -2,29 +2,36 @@ from TTS.tts.utils.text.symbols import make_symbols, parse_symbols
 from TTS.utils.generic_utils import find_module
 
 
-def setup_model(config):
+def setup_model(config, speaker_manager: "SpeakerManager" = None):
     print(" > Using model: {}".format(config.model))
-
-    MyModel = find_module("TTS.tts.models", config.model.lower())
+    # fetch the right model implementation.
+    if "base_model" in config and config["base_model"] is not None:
+        MyModel = find_module("TTS.tts.models", config.base_model.lower())
+    else:
+        MyModel = find_module("TTS.tts.models", config.model.lower())
     # define set of characters used by the model
     if config.characters is not None:
         # set characters from config
-        symbols, phonemes = make_symbols(**config.characters.to_dict())  # pylint: disable=redefined-outer-name
+        if hasattr(MyModel, "make_symbols"):
+            symbols = MyModel.make_symbols(config)
+        else:
+            symbols, phonemes = make_symbols(**config.characters)
     else:
         from TTS.tts.utils.text.symbols import phonemes, symbols  # pylint: disable=import-outside-toplevel
 
+        if config.use_phonemes:
+            symbols = phonemes
         # use default characters and assign them to config
         config.characters = parse_symbols()
-    num_chars = len(phonemes) if config.use_phonemes else len(symbols)
     # consider special `blank` character if `add_blank` is set True
-    num_chars = num_chars + getattr(config, "add_blank", False)
+    num_chars = len(symbols) + getattr(config, "add_blank", False)
     config.num_chars = num_chars
     # compatibility fix
     if "model_params" in config:
         config.model_params.num_chars = num_chars
     if "model_args" in config:
         config.model_args.num_chars = num_chars
-    model = MyModel(config)
+    model = MyModel(config, speaker_manager=speaker_manager)
     return model
 
 

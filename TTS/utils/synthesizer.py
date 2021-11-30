@@ -12,7 +12,6 @@ from TTS.tts.utils.speakers import SpeakerManager
 # pylint: disable=unused-wildcard-import
 # pylint: disable=wildcard-import
 from TTS.tts.utils.synthesis import synthesis, trim_silence
-from TTS.tts.utils.text import make_symbols, phonemes, symbols
 from TTS.utils.audio import AudioProcessor
 from TTS.vocoder.models import setup_model as setup_vocoder_model
 from TTS.vocoder.utils.generic_utils import interpolate_vocoder_input
@@ -75,6 +74,8 @@ class Synthesizer(object):
         if vocoder_checkpoint:
             self._load_vocoder(vocoder_checkpoint, vocoder_config, use_cuda)
             self.output_sample_rate = self.vocoder_config.audio["sample_rate"]
+        else:
+            print(" > Using Griffin-Lim as no vocoder model defined")
 
     @staticmethod
     def _get_segmenter(lang: str):
@@ -88,23 +89,14 @@ class Synthesizer(object):
         """
         return pysbd.Segmenter(language=lang, clean=True)
 
-    def _load_speakers(self, speaker_file: str) -> None:
-        """Load the SpeakerManager to organize multi-speaker TTS. It loads the speakers meta-data and the speaker
-        encoder if it is defined.
-
-        Args:
-            speaker_file (str): path to the speakers meta-data file.
-        """
-        print("Loading speakers ...")
-        self.speaker_manager = SpeakerManager(
-            encoder_model_path=self.encoder_checkpoint, encoder_config_path=self.encoder_config
-        )
-        self.speaker_manager.load_d_vectors_file(self.tts_config.get("d_vector_file", speaker_file))
-        self.num_speakers = self.speaker_manager.num_speakers
-        self.d_vector_dim = self.speaker_manager.d_vector_dim
-
     def _load_tts(self, tts_checkpoint: str, tts_config_path: str, use_cuda: bool) -> None:
         """Load the TTS model.
+
+        1. Load the model config.
+        2. Init the AudioProcessor.
+        3. Init the model from the config.
+        4. Move the model to the GPU if CUDA is enabled.
+        5. Init the speaker manager for the model.
 
         Args:
             tts_checkpoint (str): path to the model checkpoint.
@@ -113,32 +105,41 @@ class Synthesizer(object):
         """
         # pylint: disable=global-statement
 
-        global symbols, phonemes
         self.tts_config = load_config(tts_config_path)
         self.use_phonemes = self.tts_config.use_phonemes
         self.ap = AudioProcessor(verbose=False, **self.tts_config.audio)
 
-        if self.tts_config.has("characters") and self.tts_config.characters:
-            symbols, phonemes = make_symbols(**self.tts_config.characters)
+        speaker_manager = self._init_speaker_manager()
 
-        if self.use_phonemes:
-            self.input_size = len(phonemes)
-        else:
-            self.input_size = len(symbols)
-
-        if self.tts_config.use_speaker_embedding is True:
-            self.tts_speakers_file = (
-                self.tts_speakers_file if self.tts_speakers_file else self.tts_config["d_vector_file"]
-            )
-            self.tts_config["d_vector_file"] = self.tts_speakers_file
-
-        self.tts_model = setup_tts_model(config=self.tts_config)
+        self.tts_model = setup_tts_model(config=self.tts_config, speaker_manager=speaker_manager)
         self.tts_model.load_checkpoint(self.tts_config, tts_checkpoint, eval=True)
         if use_cuda:
             self.tts_model.cuda()
 
+    def _init_speaker_manager(self):
+        """Initialize the SpeakerManager"""
+        # setup if multi-speaker settings are in the global model config
+        speaker_manager = None
+        if hasattr(self.tts_config, "use_speaker_embedding") and self.tts_config.use_speaker_embedding is True:
+            if self.tts_speakers_file:
+                speaker_manager = SpeakerManager(speaker_id_file_path=self.tts_speakers_file)
+            if self.tts_config.get("speakers_file", None):
+                speaker_manager = SpeakerManager(speaker_id_file_path=self.tts_config.speakers_file)
+
+        if hasattr(self.tts_config, "use_d_vector_file") and self.tts_config.use_speaker_embedding is True:
+            if self.tts_speakers_file:
+                speaker_manager = SpeakerManager(d_vectors_file_path=self.tts_speakers_file)
+            if self.tts_config.get("d_vector_file", None):
+                speaker_manager = SpeakerManager(d_vectors_file_path=self.tts_config.d_vector_file)
+        return speaker_manager
+
     def _load_vocoder(self, model_file: str, model_config: str, use_cuda: bool) -> None:
         """Load the vocoder model.
+
+        1. Load the vocoder config.
+        2. Init the AudioProcessor for the vocoder.
+        3. Init the vocoder model from the config.
+        4. Move the model to the GPU if CUDA is enabled.
 
         Args:
             model_file (str): path to the model checkpoint.
@@ -187,15 +188,23 @@ class Synthesizer(object):
         """
         start_time = time.time()
         wavs = []
-        speaker_embedding = None
         sens = self.split_into_sentences(text)
         print(" > Text splitted to sentences.")
         print(sens)
 
-        if self.tts_speakers_file:
-            # get the speaker embedding from the saved d_vectors.
+        # handle multi-speaker
+        speaker_embedding = None
+        speaker_id = None
+        if self.tts_speakers_file or hasattr(self.tts_model.speaker_manager, "speaker_ids"):
             if speaker_idx and isinstance(speaker_idx, str):
-                speaker_embedding = self.tts_model.speaker_manager.get_d_vectors_by_speaker(speaker_idx)[0]
+                if self.tts_config.use_d_vector_file:
+                    # get the speaker embedding from the saved d_vectors.
+                    speaker_embedding = self.tts_model.speaker_manager.get_d_vectors_by_speaker(speaker_idx)[0]
+                    speaker_embedding = np.array(speaker_embedding)[None, :]  # [1 x embedding_dim]
+                else:
+                    # get speaker idx from the speaker name
+                    speaker_id = self.tts_model.speaker_manager.speaker_ids[speaker_idx]
+
             elif not speaker_idx and not speaker_wav:
                 raise ValueError(
                     " [!] Look like you use a multi-speaker model. "
@@ -206,13 +215,13 @@ class Synthesizer(object):
         else:
             if speaker_idx:
                 raise ValueError(
-                    f" [!] Missing speaker.json file path for selecting speaker {speaker_idx}."
+                    f" [!] Missing speakers.json file path for selecting speaker {speaker_idx}."
                     "Define path for speaker.json if it is a multi-speaker model or remove defined speaker idx. "
                 )
 
         # compute a new d_vector from the given clip.
         if speaker_wav is not None:
-            speaker_embedding = self.speaker_manager.compute_d_vector_from_clip(speaker_wav)
+            speaker_embedding = self.tts_model.speaker_manager.compute_d_vector_from_clip(speaker_wav)
 
         use_gl = self.vocoder_model is None
 
@@ -224,14 +233,14 @@ class Synthesizer(object):
                 CONFIG=self.tts_config,
                 use_cuda=self.use_cuda,
                 ap=self.ap,
-                speaker_id=None,
+                speaker_id=speaker_id,
                 style_wav=style_wav,
                 enable_eos_bos_chars=self.tts_config.enable_eos_bos_chars,
                 use_griffin_lim=use_gl,
                 d_vector=speaker_embedding,
             )
             waveform = outputs["wav"]
-            mel_postnet_spec = outputs["model_outputs"]
+            mel_postnet_spec = outputs["outputs"]["model_outputs"][0].detach().cpu().numpy()
             if not use_gl:
                 # denormalize tts output based on tts audio config
                 mel_postnet_spec = self.ap.denormalize(mel_postnet_spec.T).T
@@ -258,7 +267,8 @@ class Synthesizer(object):
             waveform = waveform.squeeze()
 
             # trim silence
-            waveform = trim_silence(waveform, self.ap)
+            if self.tts_config.audio["do_trim_silence"] is True:
+                waveform = trim_silence(waveform, self.ap)
 
             wavs += list(waveform)
             wavs += [0] * 10000

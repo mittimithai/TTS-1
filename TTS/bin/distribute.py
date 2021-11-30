@@ -35,6 +35,7 @@ def main():
     command.append("--restore_path={}".format(args.restore_path))
     command.append("--config_path={}".format(args.config_path))
     command.append("--group_id=group_{}".format(group_id))
+    command.append("--use_ddp=true")
     command += unargs
     command.append("")
 
@@ -47,7 +48,7 @@ def main():
         my_env["CUDA_VISIBLE_DEVICES"] = "{}".format(value)
         command[-1] = "--rank={}".format(i)
         # prevent stdout for processes with rank != 0
-        stdout = None if i == 0 else open(os.devnull, "w")
+        stdout = None
         p = subprocess.Popen(["python3"] + command, stdout=stdout, env=my_env)  # pylint: disable=consider-using-with
         processes.append(p)
         print(command)

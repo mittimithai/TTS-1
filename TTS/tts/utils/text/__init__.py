@@ -2,10 +2,10 @@
 # adapted from https://github.com/keithito/tacotron
 
 import re
-import unicodedata
+from typing import Dict, List
 
 import gruut
-from packaging import version
+from gruut_ipa import IPA
 
 from TTS.tts.utils.text import cleaners
 from TTS.tts.utils.text.chinese_mandarin.phonemizer import chinese_text_to_phonemes
@@ -22,6 +22,7 @@ _id_to_phonemes = {i: s for i, s in enumerate(phonemes)}
 
 _symbols = symbols
 _phonemes = phonemes
+
 # Regular expression matching text enclosed in curly braces:
 _CURLY_RE = re.compile(r"(.*?)\{(.+?)\}(.*)")
 
@@ -32,7 +33,7 @@ PHONEME_PUNCTUATION_PATTERN = r"[" + _punctuations.replace(" ", "") + "]+"
 GRUUT_TRANS_TABLE = str.maketrans("g", "ɡ")
 
 
-def text2phone(text, language, use_espeak_phonemes=False):
+def text2phone(text, language, use_espeak_phonemes=False, keep_stress=False):
     """Convert graphemes to phonemes.
     Parameters:
             text (str): text to phonemize
@@ -45,46 +46,50 @@ def text2phone(text, language, use_espeak_phonemes=False):
     # TO REVIEW : How to have a good implementation for this?
     if language == "zh-CN":
         ph = chinese_text_to_phonemes(text)
-        print(" > Phonemes: {}".format(ph))
         return ph
 
     if language == "ja-jp":
         ph = japanese_text_to_phonemes(text)
-        print(" > Phonemes: {}".format(ph))
         return ph
 
-    if gruut.is_language_supported(language):
-        # Use gruut for phonemization
-        phonemizer_args = {
-            "remove_stress": True,
-            "ipa_minor_breaks": False,  # don't replace commas/semi-colons with IPA |
-            "ipa_major_breaks": False,  # don't replace periods with IPA ‖
-        }
+    if not gruut.is_language_supported(language):
+        raise ValueError(f" [!] Language {language} is not supported for phonemization.")
 
-        if use_espeak_phonemes:
-            # Use a lexicon/g2p model train on eSpeak IPA instead of gruut IPA.
-            # This is intended for backwards compatibility with TTS<=v0.0.13
-            # pre-trained models.
-            phonemizer_args["model_prefix"] = "espeak"
+    # Use gruut for phonemization
+    ph_list = []
+    for sentence in gruut.sentences(text, lang=language, espeak=use_espeak_phonemes):
+        for word in sentence:
+            if word.is_break:
+                # Use actual character for break phoneme (e.g., comma)
+                if ph_list:
+                    # Join with previous word
+                    ph_list[-1].append(word.text)
+                else:
+                    # First word is punctuation
+                    ph_list.append([word.text])
+            elif word.phonemes:
+                # Add phonemes for word
+                word_phonemes = []
 
-        ph_list = gruut.text_to_phonemes(
-            text,
-            lang=language,
-            return_format="word_phonemes",
-            phonemizer_args=phonemizer_args,
-        )
+                for word_phoneme in word.phonemes:
+                    if not keep_stress:
+                        # Remove primary/secondary stress
+                        word_phoneme = IPA.without_stress(word_phoneme)
 
-        # Join and re-split to break apart dipthongs, suprasegmentals, etc.
-        ph_words = ["|".join(word_phonemes) for word_phonemes in ph_list]
-        ph = "| ".join(ph_words)
+                    word_phoneme = word_phoneme.translate(GRUUT_TRANS_TABLE)
 
-        # Fix a few phonemes
-        ph = ph.translate(GRUUT_TRANS_TABLE)
+                    if word_phoneme:
+                        # Flatten phonemes
+                        word_phonemes.extend(word_phoneme)
 
-        print(" > Phonemes: {}".format(ph))
-        return ph
+                if word_phonemes:
+                    ph_list.append(word_phonemes)
 
-    raise ValueError(f" [!] Language {language} is not supported for phonemization.")
+    # Join and re-split to break apart dipthongs, suprasegmentals, etc.
+    ph_words = ["|".join(word_phonemes) for word_phonemes in ph_list]
+    ph = "| ".join(ph_words)
+
+    return ph
 
 
 def intersperse(sequence, token):
@@ -106,13 +111,38 @@ def pad_with_eos_bos(phoneme_sequence, tp=None):
 
 
 def phoneme_to_sequence(
-    text, cleaner_names, language, enable_eos_bos=False, tp=None, add_blank=False, use_espeak_phonemes=False
-):
+    text: str,
+    cleaner_names: List[str],
+    language: str,
+    enable_eos_bos: bool = False,
+    custom_symbols: List[str] = None,
+    tp: Dict = None,
+    add_blank: bool = False,
+    use_espeak_phonemes: bool = False,
+) -> List[int]:
+    """Converts a string of phonemes to a sequence of IDs.
+    If `custom_symbols` is provided, it will override the default symbols.
+
+    Args:
+      text (str): string to convert to a sequence
+      cleaner_names (List[str]): names of the cleaner functions to run the text through
+      language (str): text language key for phonemization.
+      enable_eos_bos (bool): whether to append the end-of-sentence and beginning-of-sentence tokens.
+      tp (Dict): dictionary of character parameters to use a custom character set.
+      add_blank (bool): option to add a blank token between each token.
+      use_espeak_phonemes (bool): use espeak based lexicons to convert phonemes to sequenc
+
+    Returns:
+      List[int]: List of integers corresponding to the symbols in the text
+    """
     # pylint: disable=global-statement
     global _phonemes_to_id, _phonemes
-    if tp:
+
+    if custom_symbols is not None:
+        _phonemes = custom_symbols
+    elif tp:
         _, _phonemes = make_symbols(**tp)
-        _phonemes_to_id = {s: i for i, s in enumerate(_phonemes)}
+    _phonemes_to_id = {s: i for i, s in enumerate(_phonemes)}
 
     sequence = []
     clean_text = _clean_text(text, cleaner_names)
@@ -127,20 +157,22 @@ def phoneme_to_sequence(
         sequence = pad_with_eos_bos(sequence, tp=tp)
     if add_blank:
         sequence = intersperse(sequence, len(_phonemes))  # add a blank token (new), whose id number is len(_phonemes)
-
     return sequence
 
 
-def sequence_to_phoneme(sequence, tp=None, add_blank=False):
+def sequence_to_phoneme(sequence: List, tp: Dict = None, add_blank=False, custom_symbols: List["str"] = None):
     # pylint: disable=global-statement
     """Converts a sequence of IDs back to a string"""
     global _id_to_phonemes, _phonemes
     if add_blank:
         sequence = list(filter(lambda x: x != len(_phonemes), sequence))
     result = ""
-    if tp:
+
+    if custom_symbols is not None:
+        _phonemes = custom_symbols
+    elif tp:
         _, _phonemes = make_symbols(**tp)
-        _id_to_phonemes = {i: s for i, s in enumerate(_phonemes)}
+    _id_to_phonemes = {i: s for i, s in enumerate(_phonemes)}
 
     for symbol_id in sequence:
         if symbol_id in _id_to_phonemes:
@@ -149,27 +181,32 @@ def sequence_to_phoneme(sequence, tp=None, add_blank=False):
     return result.replace("}{", " ")
 
 
-def text_to_sequence(text, cleaner_names, tp=None, add_blank=False):
+def text_to_sequence(
+    text: str, cleaner_names: List[str], custom_symbols: List[str] = None, tp: Dict = None, add_blank: bool = False
+) -> List[int]:
     """Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
-
-    The text can optionally have ARPAbet sequences enclosed in curly braces embedded
-    in it. For example, "Turn left on {HH AW1 S S T AH0 N} Street."
+    If `custom_symbols` is provided, it will override the default symbols.
 
     Args:
-      text: string to convert to a sequence
-      cleaner_names: names of the cleaner functions to run the text through
-      tp: dictionary of character parameters to use a custom character set.
+      text (str): string to convert to a sequence
+      cleaner_names (List[str]): names of the cleaner functions to run the text through
+      tp (Dict): dictionary of character parameters to use a custom character set.
+      add_blank (bool): option to add a blank token between each token.
 
     Returns:
-      List of integers corresponding to the symbols in the text
+      List[int]: List of integers corresponding to the symbols in the text
     """
     # pylint: disable=global-statement
     global _symbol_to_id, _symbols
-    if tp:
+
+    if custom_symbols is not None:
+        _symbols = custom_symbols
+    elif tp:
         _symbols, _ = make_symbols(**tp)
-        _symbol_to_id = {s: i for i, s in enumerate(_symbols)}
+    _symbol_to_id = {s: i for i, s in enumerate(_symbols)}
 
     sequence = []
+
     # Check for curly braces and treat their contents as ARPAbet:
     while text:
         m = _CURLY_RE.match(text)
@@ -185,14 +222,17 @@ def text_to_sequence(text, cleaner_names, tp=None, add_blank=False):
     return sequence
 
 
-def sequence_to_text(sequence, tp=None, add_blank=False):
+def sequence_to_text(sequence: List, tp: Dict = None, add_blank=False, custom_symbols: List[str] = None):
     """Converts a sequence of IDs back to a string"""
     # pylint: disable=global-statement
     global _id_to_symbol, _symbols
     if add_blank:
         sequence = list(filter(lambda x: x != len(_symbols), sequence))
 
-    if tp:
+    if custom_symbols is not None:
+        _symbols = custom_symbols
+        _id_to_symbol = {i: s for i, s in enumerate(_symbols)}
+    elif tp:
         _symbols, _ = make_symbols(**tp)
         _id_to_symbol = {i: s for i, s in enumerate(_symbols)}
 

@@ -3,7 +3,7 @@ import os
 import shutil
 
 from tests import get_device_id, get_tests_output_path, run_cli
-from TTS.tts.configs import AlignTTSConfig
+from TTS.tts.configs.align_tts_config import AlignTTSConfig
 
 config_path = os.path.join(get_tests_output_path(), "test_model_config.json")
 output_path = os.path.join(get_tests_output_path(), "train_outputs")
@@ -27,6 +27,7 @@ config = AlignTTSConfig(
         "Be a voice, not an echo.",
     ],
 )
+
 config.audio.do_trim_silence = True
 config.audio.trim_db = 60
 config.save_json(config_path)
