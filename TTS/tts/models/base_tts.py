@@ -63,7 +63,7 @@ class BaseTTS(BaseModel):
         if config.characters is not None:
             symbols, phonemes = make_symbols(**config.characters)
         elif config.symbol_embedding:
-            symbols = config.symbol_embedding.symbols
+            symbols = config.symbol_embedding.symbols()
         else:
             from TTS.tts.utils.text.symbols import parse_symbols, phonemes, symbols
 
