@@ -218,4 +218,5 @@ class BaseTTSConfig(BaseTrainingConfig):
     lr_scheduler_params: dict = field(default_factory=lambda: {})
     # testing
     test_sentences: List[str] = field(default_factory=lambda: [])
+    symbol_embedding_filename: str = None
 

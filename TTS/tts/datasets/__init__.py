@@ -67,14 +67,12 @@ def load_tts_samples(
     meta_data_train_all = []
     meta_data_eval_all = [] if eval_split else None
 
-    preprocessor_args = {}
+    formatter_args = {}
 
-    if "symbol_embedding_filename" in config and config.symbol_embedding_filename is not None:
+    if "symbol_embedding_filename" in config:
         symbol_embedding = SymbolEmbedding(config.symbol_embedding_filename)
         config.update({"symbol_embedding": symbol_embedding}, allow_new=True)
-
-    if "symbol_embedding" in config and config.symbol_embedding is not None:
-        preprocessor_args["symbol_embedding"] = config.symbol_embedding
+        formatter_args["symbol_embedding"] = config.symbol_embedding
 
 
     for dataset in datasets:
@@ -96,7 +94,7 @@ def load_tts_samples(
         if eval_split:
             if meta_file_val:
                 formatter_args["meta_file"] = meta_file_val
-                meta_data_eval = formatter(**preprocessor_args)
+                meta_data_eval = formatter(**formatter_args)
 
             else:
                 meta_data_eval, meta_data_train = split_dataset(meta_data_train)
