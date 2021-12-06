@@ -40,7 +40,7 @@ class Tacotron2(BaseTacotron):
             Speaker manager for multi-speaker training. Uuse only for multi-speaker training. Defaults to None.
     """
 
-    def __init__(self, config: Coqpit, speaker_manager: SpeakerManager = None):
+    def __init__(self, config: Coqpit, speaker_manager: SpeakerManager = None, symbol_embedding=None):
         super().__init__(config)
 
         self.speaker_manager = speaker_manager
@@ -62,8 +62,7 @@ class Tacotron2(BaseTacotron):
             self.decoder_in_features += self.gst.gst_embedding_dim
 
         # embedding layer
-        if config.symbol_embedding:
-            symbol_embedding = config.symbol_embedding
+        if symbol_embedding:
             self.pre_embedding = nn.Embedding(
                 symbol_embedding.num_symbols(), symbol_embedding.embedding_size(), padding_idx=0
             )

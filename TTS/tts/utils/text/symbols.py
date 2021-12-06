@@ -103,7 +103,6 @@ class SymbolEmbedding:
 
         for index, (symbol, embedding) in enumerate(symbol_embedding_json.embeddings.items()):
             self.symbol_index_lut[symbol] = index
-            # embedding = symbol_embedding_json.embeddings[symbol]
             embeddings.append(np.array(embedding))
 
         self.weight_matrix = np.vstack(embeddings)

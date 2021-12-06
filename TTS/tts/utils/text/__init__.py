@@ -249,6 +249,7 @@ def sequence_to_text(sequence: List, tp: Dict = None, add_blank=False, custom_sy
 
 def _clean_text(text, cleaner_names):
     for name in cleaner_names:
+        if not name: continue
         cleaner = getattr(cleaners, name)
         if not cleaner:
             raise Exception("Unknown cleaner: %s" % name)

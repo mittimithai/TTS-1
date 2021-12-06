@@ -2,7 +2,7 @@ from TTS.tts.utils.text.symbols import SymbolEmbedding, make_symbols, parse_symb
 from TTS.utils.generic_utils import find_module
 
 
-def setup_model(config, speaker_manager: "SpeakerManager" = None):
+def setup_model(config, speaker_manager: "SpeakerManager" = None, symbol_embedding=None):
     print(" > Using model: {}".format(config.model))
     # fetch the right model implementation.
     if "base_model" in config and config["base_model"] is not None:
@@ -10,18 +10,16 @@ def setup_model(config, speaker_manager: "SpeakerManager" = None):
     else:
         MyModel = find_module("TTS.tts.models", config.model.lower())
     # define set of characters used by the model
-    if "symbol_embedding_filename" in config and config.symbol_embedding_filename is not None:
-        symbol_embedding = SymbolEmbedding(config.symbol_embedding_filename)
-        config.update({"symbol_embedding": symbol_embedding}, allow_new=True)
-        symbols = config.symbol_embedding.symbols()
 
+
+    if symbol_embedding:
+        symbols = symbol_embedding.symbols()
     elif config.characters is not None:
         # set characters from config
         if hasattr(MyModel, "make_symbols"):
             symbols = MyModel.make_symbols(config)
         else:
             symbols, phonemes = make_symbols(**config.characters)
-
 
     else:
         from TTS.tts.utils.text.symbols import phonemes, symbols  # pylint: disable=import-outside-toplevel
@@ -39,7 +37,7 @@ def setup_model(config, speaker_manager: "SpeakerManager" = None):
         config.model_params.num_chars = num_chars
     if "model_args" in config:
         config.model_args.num_chars = num_chars
-    model = MyModel(config, speaker_manager=speaker_manager)
+    model = MyModel(config, speaker_manager=speaker_manager, symbol_embedding=symbol_embedding)
     return model
 
 

@@ -6,7 +6,7 @@ from TTS.tts.datasets import load_tts_samples
 from TTS.tts.models import setup_model
 from TTS.tts.utils.speakers import SpeakerManager
 from TTS.utils.audio import AudioProcessor
-
+from TTS.tts.utils.text.symbols import SymbolEmbedding
 
 def main():
     """Run `tts` model training directly by a `config.json` file."""
@@ -52,8 +52,16 @@ def main():
     else:
         speaker_manager = None
 
+
+    if "symbol_embedding_filename" in config and config.symbol_embedding_filename is not None:
+        symbol_embedding = SymbolEmbedding(config.symbol_embedding_filename)
+        symbols = config.symbol_embedding.symbols()
+    else:
+        symbol_embedding = None
+
+
     # init the model from config
-    model = setup_model(config, speaker_manager)
+    model = setup_model(config, speaker_manager, symbol_embedding)
 
     # init the trainer and 🚀
     trainer = Trainer(

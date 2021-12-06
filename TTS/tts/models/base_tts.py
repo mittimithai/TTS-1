@@ -212,7 +212,7 @@ class BaseTTS(BaseModel):
                 ap=ap,
                 characters=config.characters,
                 custom_symbols=custom_symbols,
-                symbol_embedding=config.symbol_embedding,
+                symbol_embedding=None,
                 add_blank=config["add_blank"],
                 return_wav=config.return_wav if "return_wav" in config else False,
                 batch_group_size=0 if is_eval else config.batch_group_size * config.batch_size,

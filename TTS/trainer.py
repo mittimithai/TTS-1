@@ -85,8 +85,10 @@ class TrainingArgs(Coqpit):
     group_id: str = field(default="", metadata={"help": "Process group id in distributed training."})
     use_ddp: bool = field(
         default=False,
-        metadata={"help": "Use DDP in distributed training. It is to set in `distribute.py`. Do not set manually."},
-    )
+        metadata={"help": "Use DDP in distributed training. It is to set in `distribute.py`. Do not set manually."})
+    num_gpus: int = field(
+        default=1,
+        metadata={"help": "internal global number of gpus"},)
 
 
 class Trainer:
@@ -217,7 +219,8 @@ class Trainer:
         time.sleep(1.0)  # wait for the logger to be ready
 
         # set and initialize Pytorch runtime
-        self.use_cuda, self.num_gpus = setup_torch_training_env(True, cudnn_benchmark, args.use_ddp)
+        self.use_cuda, _ = setup_torch_training_env(True, cudnn_benchmark, args.use_ddp)
+        self.num_gpus=args.num_gpus
 
         # init loggers
         self.c_logger = ConsoleLogger() if c_logger is None else c_logger

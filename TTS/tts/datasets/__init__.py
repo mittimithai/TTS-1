@@ -69,7 +69,7 @@ def load_tts_samples(
 
     formatter_args = {}
 
-    if "symbol_embedding_filename" in config:
+    if "symbol_embedding_filename" in config and config.symbol_embedding_filename is not None:
         symbol_embedding = SymbolEmbedding(config.symbol_embedding_filename)
         config.update({"symbol_embedding": symbol_embedding}, allow_new=True)
         formatter_args["symbol_embedding"] = config.symbol_embedding

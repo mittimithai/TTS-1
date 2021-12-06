@@ -20,6 +20,7 @@ def main():
     args, unargs = parser.parse_known_args()
 
     num_gpus = torch.cuda.device_count()
+
     group_id = time.strftime("%Y_%m_%d-%H%M%S")
 
     assert num_gpus > 1, 'distributed.py requires multiple available GPUs'
@@ -36,6 +37,7 @@ def main():
     command.append("--config_path={}".format(args.config_path))
     command.append("--group_id=group_{}".format(group_id))
     command.append("--use_ddp=true")
+    command.append("--num_gpus={}".format(num_gpus))
     command += unargs
     command.append("")
 
@@ -46,7 +48,7 @@ def main():
     for i, value in enumerate(gpus):
         my_env = os.environ.copy()
         my_env["PYTHON_EGG_CACHE"] = "/tmp/tmp{}".format(i)
-        my_env["CUDA_VISIBLE_DEVICES"] = "{}".format(value)
+        #my_env["CUDA_VISIBLE_DEVICES"] = "{}".format(value)
         command[-1] = "--rank={}".format(i)
         # prevent stdout for processes with rank != 0
         stdout = None

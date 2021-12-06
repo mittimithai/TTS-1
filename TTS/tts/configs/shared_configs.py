@@ -1,10 +1,10 @@
 from dataclasses import asdict, dataclass, field
 from typing import List
 
+
 from coqpit import Coqpit, check_argument
 
 from TTS.config import BaseAudioConfig, BaseDatasetConfig, BaseTrainingConfig
-
 
 @dataclass
 class GSTConfig(Coqpit):
