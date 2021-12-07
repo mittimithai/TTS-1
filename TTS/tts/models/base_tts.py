@@ -16,6 +16,7 @@ from TTS.tts.utils.speakers import SpeakerManager, get_speaker_manager
 from TTS.tts.utils.synthesis import synthesis
 from TTS.tts.utils.text import make_symbols
 from TTS.tts.utils.visual import plot_alignment, plot_spectrogram
+from TTS.tts.utils.text.symbols import SymbolEmbedding
 
 # pylint: skip-file
 
@@ -72,6 +73,10 @@ class BaseTTS(BaseModel):
     def get_speaker_manager(config: Coqpit, restore_path: str, data: List, out_path: str = None) -> SpeakerManager:
         return get_speaker_manager(config, restore_path, data, out_path)
 
+    def get_symbol_embedding(self):
+        symbol_embedding = SymbolEmbedding(self.config.symbol_embedding_filename)
+        return symbol_embedding
+        
     def init_multispeaker(self, config: Coqpit):
         """Init speaker embedding layer if `use_speaker_embedding` is True and set the expected speaker embedding
         vector dimension in the network. If model uses d-vectors, then it only sets the expected dimension.
@@ -334,6 +339,7 @@ class BaseTTS(BaseModel):
                 enable_eos_bos_chars=self.config.enable_eos_bos_chars,
                 use_griffin_lim=True,
                 do_trim_silence=False,
+                symbol_embedding=self.get_symbol_embedding()
             )
             test_audios["{}-audio".format(idx)] = outputs_dict["wav"]
             test_figures["{}-prediction".format(idx)] = plot_spectrogram(

@@ -264,7 +264,9 @@ def synthesis(
     if hasattr(model, "make_symbols"):
         custom_symbols = model.make_symbols(CONFIG)
     # preprocess the given text
+    print(f"MANEESH text: {text}")
     text_inputs = text_to_seq(text, CONFIG, custom_symbols=custom_symbols,symbol_embedding=symbol_embedding)
+    print(f"MANEESH textinputs {text_inputs}")
     # pass tensors to backend
     if backend == "torch":
         if speaker_id is not None:
