@@ -27,7 +27,7 @@ class TTSDataset(Dataset):
         f0_cache_path: str = None,
         characters: Dict = None,
         custom_symbols: List = None,
-        symbol_embedding: SymbolEmbedding = None,
+        has_symbol_embedding: bool = False,
         add_blank: bool = False,
         return_wav: bool = False,
         batch_group_size: int = 0,
@@ -117,7 +117,7 @@ class TTSDataset(Dataset):
         self.ap = ap
         self.characters = characters
         self.custom_symbols = custom_symbols
-        self.symbol_embedding = symbol_embedding
+        self.has_symbol_embedding = has_symbol_embedding
         self.add_blank = add_blank
         self.use_phonemes = use_phonemes
         self.phoneme_cache_path = phoneme_cache_path
@@ -213,7 +213,7 @@ class TTSDataset(Dataset):
         if self.use_noise_augment:
             wav = wav + (1.0 / 32768.0) * np.random.rand(*wav.shape)
 
-        if self.symbol_embedding:
+        if self.has_symbol_embedding:
             self.input_seq_computed = True
 
         if not self.input_seq_computed:

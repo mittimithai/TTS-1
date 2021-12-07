@@ -208,7 +208,7 @@ def text_to_sequence(
     sequence = []
 
     # Check for curly braces and treat their contents as ARPAbet:
-    while text:
+    while len(text)>0:
         m = _CURLY_RE.match(text)
         if not m:
             sequence += _symbols_to_sequence(_clean_text(text, cleaner_names))
