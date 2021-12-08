@@ -84,6 +84,10 @@ class SymbolEmbedding:
         self.load_symbol_embedding(symbol_embedding_filename)
 
     def __getitem__(self, x):
+        try:
+            return self.symbol_index_lut[x]
+        except KeyError:
+            raise Exception('\nKey {} not found in symbol index:\n{}\n'.format(x, self.symbol_index_lut.keys()))
         return self.symbol_index_lut[x]
 
     def symbols(self):

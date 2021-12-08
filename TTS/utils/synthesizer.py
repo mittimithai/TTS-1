@@ -123,7 +123,7 @@ class Synthesizer(object):
 
         speaker_manager = self._init_speaker_manager()
 
-        self.tts_model = setup_tts_model(config=self.tts_config, speaker_manager=speaker_manager, self.symbol_embedding)
+        self.tts_model = setup_tts_model(config=self.tts_config, speaker_manager=speaker_manager, symbol_embedding=self.symbol_embedding)
 
         self.tts_model.load_checkpoint(self.tts_config, tts_checkpoint, eval=True)
 
@@ -254,7 +254,7 @@ class Synthesizer(object):
                 enable_eos_bos_chars=self.tts_config.enable_eos_bos_chars,
                 use_griffin_lim=use_gl,
                 d_vector=speaker_embedding,
-                symbol_emebdding=self.symbol_embedding
+                symbol_embedding=self.symbol_embedding
             )
             waveform = outputs["wav"]
             mel_postnet_spec = outputs["outputs"]["model_outputs"][0].detach().cpu().numpy()
